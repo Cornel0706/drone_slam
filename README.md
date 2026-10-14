@@ -5,9 +5,6 @@
 [![PX4](https://img.shields.io/badge/PX4-Autopilot-purple)](https://px4.io/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-> **Bachelor's Thesis Project** — [Your University], [Faculty], [Year]
-> **Supervisor:** [Supervisor Name]
-
 ## Overview
 
 This repository contains the full software implementation of an autonomous drone navigation system using **Visual SLAM** (Simultaneous Localization and Mapping).
@@ -25,7 +22,7 @@ The system enables a quadrotor drone to:
 |-----------|-------|------|
 | **Frame** | HolyBro S500 V2 | Quadrotor mechanical structure |
 | **Flight Controller** | Pixhawk 6C Mini (PX4) | Low-level flight control, internal EKF2 |
-| **Companion Computer** | Raspberry Pi 5 (8GB RAM) | Vision processing, SLAM, ROS2 |
+| **Companion Computer** | Raspberry Pi 5 | Vision processing, SLAM, ROS2 |
 | **Camera** | Luxonis OAK-S2 | Stereo RGB-D + integrated IMU (BMI270) |
 | **OS** | Ubuntu 24.04 LTS (aarch64) | Operating system on RPi5 |
 | **Middleware** | ROS2 Jazzy Jalisco | Robotics communication framework |
@@ -272,5 +269,3 @@ MAVLink is the lightweight messaging protocol used by PX4. MAVROS is the ROS2 br
 MIT License — see [LICENSE](LICENSE) for details.
 
 ---
-
-*Developed as part of a Bachelor's Thesis project on autonomous drone navigation systems.*
