@@ -1,0 +1,83 @@
+# ============================================================
+#  Parametri camera Luxonis OAK-S2
+#  Documentatie: https://docs.luxonis.com/software/ros/depthai-ros/
+#
+#  OAK-S2 este o camera stereo cu IMU integrat (IMU BMI270).
+#  Aceasta configuratie este optimizata pentru o drona:
+#    - Rezolutie redusa (720P RGB, 640x400 stereo) → CPU scazut
+#    - FPS 20 → suficient pentru SLAM, fara sa suprasolicitam RPi5
+#    - IMU la 200Hz → esential pentru fuzionarea cu EKF
+#    - Depth aliniat cu RGB → usor de folosit in RTAB-Map
+# ============================================================
+
+camera:
+  ros__parameters:
+
+    # ── Pipeline ──────────────────────────────────────────────
+    camera:
+      # RGBD = RGB + Depth (stereo)
+      i_pipeline_type: "RGBD"
+
+      # Numele frame-ului camerei in TF tree
+      i_tf_camera_name: "oak"
+
+      # Frame-ul parinte (centrul dronei)
+      i_tf_parent_frame: "base_link"
+
+      # IR dezactivat (exterior, lumina naturala suficienta)
+      i_enable_ir: false
+
+      # Retea neuronala dezactivata (economisire CPU)
+      i_nn_type: "none"
+
+      # ID dispozitiv vid = primul USB gasit automat
+      i_device_id: ""
+
+    # ── Camera RGB (senzor color central) ─────────────────────
+    rgb:
+      # 720P = 1280x720 px - echilibru calitate/performanta
+      i_resolution: "720P"
+
+      # 20 cadre/secunda - suficient pentru SLAM vizual
+      i_fps: 20
+
+      # Publica topic-ul RGB
+      i_publish_topic: true
+
+      # Non-intercalat (imagini complete, nu alternante)
+      i_interleaved: false
+
+    # ── Camera Stereo (pereche stanga-dreapta pentru depth) ───
+    stereo:
+      # Rezolutie: 640x400 px (OV7251 sensors)
+      i_width: 640
+      i_height: 400
+
+      # Aliniaza imaginea depth cu RGB (acelasi frame)
+      i_align_depth: true
+
+      # HIGH_ACCURACY = mai putine artefacte, mai lent
+      # HIGH_DENSITY  = mai rapid, putine gol-uri
+      i_depth_preset: "HIGH_ACCURACY"
+
+      # Left-Right check: elimina pixeli ambigui
+      i_lr_check: true
+
+      # Publica harta de adancime
+      i_output_depth: true
+
+      # Subpixel = precizie mai mare la distante mari
+      i_subpixel: true
+
+    # ── IMU (BMI270: Accelerometru + Giroscop) ────────────────
+    imu:
+      # Activeaza publicarea IMU
+      i_enable_imu: true
+
+      # 200 Hz = frecventa standard pentru EKF pe drona
+      i_acc_freq: 200
+      i_gyro_freq: 200
+
+      # Trimite datele la fiecare sample (latenta minima)
+      i_batch_report_threshold: 1
+      i_max_batch_reports: 10

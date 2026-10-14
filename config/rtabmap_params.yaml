@@ -1,0 +1,92 @@
+# ============================================================
+#  Configurare RTAB-Map — parametri optimizati pentru drona
+#  Documentatie: https://github.com/introlab/rtabmap_ros
+#
+#  RTAB-Map (Real-Time Appearance-Based Mapping) este un sistem
+#  SLAM care foloseste imagini RGB-D pentru:
+#    1. Odometrie vizuala (estimare pozitie locala)
+#    2. Loop closure (recunoastere zone vizitate anterior)
+#    3. Construire harta 3D (point cloud + ocupancy grid)
+#
+#  Sunt doi noduri principale:
+#    - rtabmap_odom::RGBDOdometry  → odometrie rapida (frontend)
+#    - rtabmap_slam::Rtabmap       → SLAM complet (backend)
+# ============================================================
+
+# ── Nod odometrie vizuala (RGBDOdometry) ──────────────────────
+rgbd_odometry_node:
+  ros__parameters:
+    # Frame-ul robotului (centrul dronei)
+    frame_id: "base_link"
+
+    # Frame-ul odometriei (fix la start)
+    odom_frame_id: "odom"
+
+    # Sincronizare aproximativa a topic-urilor (camerele nu sunt perfect sincrone)
+    approx_sync: true
+
+    # Interval maxim de sincronizare (ms) — 20ms pentru 20fps
+    approx_sync_max_interval: 0.02
+
+    # Asteapta IMU-ul pentru initializare orientare (important pentru drona)
+    wait_imu_to_init: true
+
+    # ── Strategia de odometrie ──────────────────────────────
+    # "0" = Frame-to-Map (mai robust, recomandant pentru drone)
+    # "1" = Frame-to-Frame (mai rapid, mai drift)
+    Odom/Strategy: "0"
+
+    # Detectia caracteristicilor vizuale (keypoints)
+    # GFTT = Good Features to Track (Harris + Shi-Tomasi)
+    Vis/FeatureType: "6"        # GFTT
+    GFTT/MinDistance: "5"       # distanta minima intre keypoints (px)
+    GFTT/QualityLevel: "0.001"  # prag calitate keypoint
+
+    # Minim 10 puncte comune pentru estimare valida
+    Vis/MinInliers: "10"
+
+    # Distanta maxima admisa pentru inlier (in metrie)
+    Vis/InlierDistance: "0.1"
+
+    # Dimensiunea maxima a hartii locale (frame-to-map)
+    OdomF2M/MaxSize: "1000"
+
+# ── Nod SLAM complet (Rtabmap) ─────────────────────────────────
+rtabmap_node:
+  ros__parameters:
+    frame_id: "base_link"
+
+    # Abonare la RGB + Depth separat (nu RGBD combinat)
+    subscribe_rgb: true
+    subscribe_depth: true
+
+    # Primeste si info de la odometrie (covariance)
+    subscribe_odom_info: true
+
+    # Sincronizare aproximativa
+    approx_sync: true
+
+    # Memorie incrementala: adauga noi locatii in memorie continuu
+    Mem/IncrementalMemory: "true"
+
+    # Nu initia memoria cu toate nodurile (start fresh)
+    Mem/InitWMWithAllNodes: "false"
+
+    # Loop closure prin proximitate spatiala (nu doar vizuala)
+    RGBD/ProximityBySpace: "true"
+
+    # Update harta doar la miscari semnificative (economisire CPU)
+    # Linear: 1cm minim inainte de update
+    RGBD/LinearUpdate: "0.01"
+    # Unghiular: ~0.57 grade minim
+    RGBD/AngularUpdate: "0.01"
+
+    # Limita de timp per iteratie SLAM (ms)
+    # 700ms = ~1.4Hz pentru backend (ok, odometria e mai rapida)
+    Rtabmap/TimeThr: "700"
+
+    # Maxim 400 caracteristici per imagine (CPu vs precizie)
+    Kp/MaxFeatures: "400"
+
+    # Detectie loop closure bazata pe vocabular vizual (Bag of Words)
+    Kp/DetectorStrategy: "6"   # GFTT (consistent cu odometria)

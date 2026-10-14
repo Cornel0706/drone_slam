@@ -1,0 +1,96 @@
+# ============================================================
+#  Configurare EKF (Extended Kalman Filter) — robot_localization
+#  Documentatie: https://docs.ros.org/en/jazzy/p/robot_localization/
+#
+#  EKF-ul fuzioneza doua surse de informatii:
+#    1. Odometria vizuala de la RTAB-Map (/rtabmap/odom)
+#       → furnizeaza pozitie (x,y,z) si viteza liniara
+#    2. IMU de la OAK-S2 (/oak/imu/data)
+#       → furnizeaza orientare (roll,pitch,yaw) si viteza unghiulara
+#
+#  Rezultatul (/odometry/filtered) este trimis la:
+#    - Pixhawk 6C Mini via MAVROS (pentru EKF2 intern PX4)
+#    - RTAB-Map SLAM backend (pentru corectie harta)
+#
+#  DE CE EKF pentru drona?
+#  O drona opereaza in 6DOF (6 grade de libertate: x,y,z,roll,pitch,yaw).
+#  Odometria vizuala singura deriva rapid la miscari rapide sau zgomot vizual.
+#  IMU-ul singur deriva in timp (integrare erori). Impreuna, se completeaza.
+# ============================================================
+
+ekf_filter_node:
+  ros__parameters:
+
+    # Frecventa de publicare a rezultatului filtrat (Hz)
+    frequency: 50.0
+
+    # Timeout senzor: daca un senzor nu trimite date >0.1s, EKF continua fara el
+    sensor_timeout: 0.1
+
+    # IMPORTANT: false = 3D (drona zboara in toate directiile)
+    # true = 2D (doar pentru roboturi pe sol)
+    two_d_mode: false
+
+    # EKF publica transformarea TF odom → base_link
+    publish_tf: true
+
+    # ── Frame-uri de referinta ────────────────────────────────
+    # map:       frame global (fix, nu se misca)
+    # odom:      frame local (fix la start, deriva acceptable pe termen scurt)
+    # base_link: centrul dronei (se misca odata cu drona)
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+
+    # ── Sursa 1: Odometrie vizuala (RTAB-Map) ─────────────────
+    odom0: /rtabmap/odom
+
+    # Configurare: ce componente folosim din acest topic
+    # Ordinea: [x,   y,   z,     | pozitie liniara
+    #           rx,  ry,  rz,    | orientare (roll,pitch,yaw)
+    #           vx,  vy,  vz,    | viteza liniara
+    #           vrx, vry, vrz,   | viteza unghiulara
+    #           ax,  ay,  az]    | acceleratie liniara
+    # true = foloseste aceasta componenta, false = ignora
+    odom0_config: [true,  true,  true,    # x, y, z
+                   false, false, false,   # orientare: RTAB da, dar IMU e mai bun
+                   true,  true,  true,    # viteza liniara: da
+                   false, false, false,   # viteza unghiulara: nu
+                   false, false, false]   # acceleratie: nu
+
+    # Odometria vizuala da pozitia absoluta (nu diferentiala)
+    odom0_differential: false
+    odom0_relative: false
+
+    # ── Sursa 2: IMU — OAK-S2 BMI270 ─────────────────────────
+    imu0: /oak/imu/data
+
+    imu0_config: [false, false, false,   # pozitie: IMU nu da
+                  true,  true,  true,    # orientare: da (roll, pitch, yaw)
+                  false, false, false,   # viteza liniara: nu
+                  true,  true,  true,    # viteza unghiulara: da
+                  true,  false, false]   # acceleratie X: da (Z si Y sunt zgomotos)
+
+    # Elimina componentele gravitationale din accelerometru
+    imu0_remove_gravitational_acceleration: true
+    imu0_relative: false
+
+    # ── Matricea de zgomot al procesului ─────────────────────
+    # Valori mai mari = mai multa incredere in masuratori, mai putina in model
+    # Valori mai mici = model mai rigid, masuratori mai putine influenta
+    process_noise_covariance: [0.05, 0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                               0,    0.05, 0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0.06, 0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0.03, 0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0.03, 0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0.06, 0,     0,     0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0.025, 0,     0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,     0.025, 0,    0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0.04, 0,    0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,    0.01, 0,    0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0.01, 0,    0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0.02, 0,    0,    0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0.01, 0,    0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0.01, 0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0.015]
