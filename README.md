@@ -133,7 +133,7 @@ drone_slam/
 ```bash
 # 1. Clone the repository
 mkdir -p ~/drone_ws/src && cd ~/drone_ws/src
-git clone https://github.com/YOUR_USERNAME/drone_slam.git
+git clone https://github.com/Cornel0706/drone_slam.git
 
 # 2. Install ROS2 dependencies
 cd ~/drone_ws
@@ -156,7 +156,7 @@ source install/setup.bash
 ```bash
 # 1. Clone the repository
 mkdir -p ~/drone_ws/src && cd ~/drone_ws/src
-git clone https://github.com/YOUR_USERNAME/drone_slam.git
+git clone https://github.com/Cornel0706/drone_slam.git
 
 # 2. Run the automated installer (installs everything)
 cd drone_slam
