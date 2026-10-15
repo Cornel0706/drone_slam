@@ -1,84 +1,87 @@
 # ============================================================
-#  Configurare EKF (Extended Kalman Filter) — robot_localization
-#  Documentatie: https://docs.ros.org/en/jazzy/p/robot_localization/
+#  EKF (Extended Kalman Filter) Configuration — robot_localization
+#  Documentation: https://docs.ros.org/en/jazzy/p/robot_localization/
 #
-#  EKF-ul fuzioneza doua surse de informatii:
-#    1. Odometria vizuala de la RTAB-Map (/rtabmap/odom)
-#       → furnizeaza pozitie (x,y,z) si viteza liniara
-#    2. IMU de la OAK-S2 (/oak/imu/data)
-#       → furnizeaza orientare (roll,pitch,yaw) si viteza unghiulara
+#  The EKF fuses two sensor streams:
+#    1. Visual odometry from RTAB-Map (/rtabmap/odom)
+#       → provides position (x,y,z) and linear velocity
+#    2. IMU from OAK-S2 (/oak/imu/data)
+#       → provides orientation (roll,pitch,yaw) and angular velocity
 #
-#  Rezultatul (/odometry/filtered) este trimis la:
-#    - Pixhawk 6C Mini via MAVROS (pentru EKF2 intern PX4)
-#    - RTAB-Map SLAM backend (pentru corectie harta)
+#  The result (/odometry/filtered) is sent to:
+#    - Pixhawk 6C Mini via MAVROS (for PX4 internal EKF2)
+#    - RTAB-Map SLAM backend (for map correction)
 #
-#  DE CE EKF pentru drona?
-#  O drona opereaza in 6DOF (6 grade de libertate: x,y,z,roll,pitch,yaw).
-#  Odometria vizuala singura deriva rapid la miscari rapide sau zgomot vizual.
-#  IMU-ul singur deriva in timp (integrare erori). Impreuna, se completeaza.
+#  WHY EKF FOR A DRONE?
+#  A drone operates with 6DOF (6 degrees of freedom: x,y,z,roll,pitch,yaw).
+#  Visual odometry alone drifts quickly during fast motion or visual noise.
+#  IMU alone drifts over time (accumulated integration error).
+#  Together, they complement each other: the IMU predicts fast motion,
+#  visual odometry corrects accumulated drift at each keyframe.
 # ============================================================
 
 ekf_filter_node:
   ros__parameters:
 
-    # Frecventa de publicare a rezultatului filtrat (Hz)
+    # Output publication frequency (Hz)
     frequency: 50.0
 
-    # Timeout senzor: daca un senzor nu trimite date >0.1s, EKF continua fara el
+    # Sensor timeout: if a sensor stops publishing for >0.1s, EKF continues without it
     sensor_timeout: 0.1
 
-    # IMPORTANT: false = 3D (drona zboara in toate directiile)
-    # true = 2D (doar pentru roboturi pe sol)
+    # IMPORTANT: false = 3D mode (drone flies in all directions)
+    # true = 2D mode (only for ground robots)
     two_d_mode: false
 
-    # EKF publica transformarea TF odom → base_link
+    # EKF publishes the TF transform: odom → base_link
     publish_tf: true
 
-    # ── Frame-uri de referinta ────────────────────────────────
-    # map:       frame global (fix, nu se misca)
-    # odom:      frame local (fix la start, deriva acceptable pe termen scurt)
-    # base_link: centrul dronei (se misca odata cu drona)
+    # ── Reference Frames ─────────────────────────────────────
+    # map:       global frame (fixed, never moves)
+    # odom:      local frame (fixed at start, acceptable short-term drift)
+    # base_link: drone body center (moves with the drone)
     map_frame: map
     odom_frame: odom
     base_link_frame: base_link
     world_frame: odom
 
-    # ── Sursa 1: Odometrie vizuala (RTAB-Map) ─────────────────
+    # ── Source 1: Visual Odometry (RTAB-Map) ──────────────────
     odom0: /rtabmap/odom
 
-    # Configurare: ce componente folosim din acest topic
-    # Ordinea: [x,   y,   z,     | pozitie liniara
-    #           rx,  ry,  rz,    | orientare (roll,pitch,yaw)
-    #           vx,  vy,  vz,    | viteza liniara
-    #           vrx, vry, vrz,   | viteza unghiulara
-    #           ax,  ay,  az]    | acceleratie liniara
-    # true = foloseste aceasta componenta, false = ignora
-    odom0_config: [true,  true,  true,    # x, y, z
-                   false, false, false,   # orientare: RTAB da, dar IMU e mai bun
-                   true,  true,  true,    # viteza liniara: da
-                   false, false, false,   # viteza unghiulara: nu
-                   false, false, false]   # acceleratie: nu
+    # Configuration: which components to use from this topic
+    # Order: [x,   y,   z,     | linear position
+    #         rx,  ry,  rz,    | orientation (roll,pitch,yaw)
+    #         vx,  vy,  vz,    | linear velocity
+    #         vrx, vry, vrz,   | angular velocity
+    #         ax,  ay,  az]    | linear acceleration
+    # true = use this component, false = ignore
+    odom0_config: [true,  true,  true,    # x, y, z position: YES
+                   false, false, false,   # orientation: RTAB provides it, but IMU is more accurate
+                   true,  true,  true,    # linear velocity: YES
+                   false, false, false,   # angular velocity: NO
+                   false, false, false]   # acceleration: NO
 
-    # Odometria vizuala da pozitia absoluta (nu diferentiala)
+    # Visual odometry provides absolute position (not differential)
     odom0_differential: false
     odom0_relative: false
 
-    # ── Sursa 2: IMU — OAK-S2 BMI270 ─────────────────────────
+    # ── Source 2: IMU — OAK-S2 BMI270 ────────────────────────
     imu0: /oak/imu/data
 
-    imu0_config: [false, false, false,   # pozitie: IMU nu da
-                  true,  true,  true,    # orientare: da (roll, pitch, yaw)
-                  false, false, false,   # viteza liniara: nu
-                  true,  true,  true,    # viteza unghiulara: da
-                  true,  false, false]   # acceleratie X: da (Z si Y sunt zgomotos)
+    imu0_config: [false, false, false,   # position: IMU does not provide this
+                  true,  true,  true,    # orientation: YES (roll, pitch, yaw)
+                  false, false, false,   # linear velocity: NO
+                  true,  true,  true,    # angular velocity: YES
+                  true,  false, false]   # X acceleration: YES (Z and Y are too noisy)
 
-    # Elimina componentele gravitationale din accelerometru
+    # Remove gravitational acceleration components from the accelerometer
     imu0_remove_gravitational_acceleration: true
     imu0_relative: false
 
-    # ── Matricea de zgomot al procesului ─────────────────────
-    # Valori mai mari = mai multa incredere in masuratori, mai putina in model
-    # Valori mai mici = model mai rigid, masuratori mai putine influenta
+    # ── Process Noise Covariance Matrix ──────────────────────
+    # Higher values = more trust in measurements, less in the model prediction
+    # Lower values  = more rigid model, measurements have less influence
+    # This is a 15x15 diagonal matrix (one entry per state variable)
     process_noise_covariance: [0.05, 0,    0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
                                0,    0.05, 0,    0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,
                                0,    0,    0.06, 0,    0,    0,    0,     0,     0,    0,    0,    0,    0,    0,    0,

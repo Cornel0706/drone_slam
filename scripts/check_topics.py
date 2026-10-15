@@ -2,22 +2,22 @@
 """
 Script: check_topics.py
 ========================
-Utilitar de diagnosticare — verifica rapid ca toate topic-urile
-necesare sunt active si au frecventa corecta.
+Diagnostic utility — quickly verifies that all required topics
+are active and publishing at the expected frequency.
 
-Ruleaza inainte de orice zbor pentru a confirma ca sistemul e functional.
+Run this before every flight to confirm the system is fully operational.
 
-Cum se ruleaza:
+How to run:
   ros2 run drone_slam check_topics.py
 
-Output exemplu:
-  ✅ /oak/rgb/image_raw          →  20.1 Hz  (asteptat: ~20)
-  ✅ /oak/imu/data               → 200.3 Hz  (asteptat: ~200)
-  ✅ /oak/stereo/image_raw       →  20.0 Hz  (asteptat: ~20)
-  ✅ /rtabmap/odom               →  15.2 Hz  (asteptat: >10)
-  ✅ /odometry/filtered          →  50.0 Hz  (asteptat: ~50)
+Example output:
+  ✅ /oak/rgb/image_raw          →  20.1 Hz  (expected: ~20)
+  ✅ /oak/imu/data               → 200.3 Hz  (expected: ~200)
+  ✅ /oak/stereo/image_raw       →  20.0 Hz  (expected: ~20)
+  ✅ /rtabmap/odom               →  15.2 Hz  (expected: >10)
+  ✅ /odometry/filtered          →  50.0 Hz  (expected: ~50)
   ✅ /mavros/state connected     →  True
-  ⚠️  /mavros/local_position/pose →   0.0 Hz  (asteptat: ~30)
+  ⚠️  /mavros/local_position/pose →   0.0 Hz  (expected: ~30)
 """
 
 import rclpy
@@ -33,15 +33,15 @@ import time
 from collections import defaultdict
 
 
-# Definitia topic-urilor de verificat
-# (topic, tip_mesaj, frecventa_minima_Hz, descriere)
+# Definition of topics to check
+# (topic, message_type, minimum_frequency_Hz, description)
 TOPICS_TO_CHECK = [
-    ('/oak/rgb/image_raw',          Image,       15.0, 'Camera RGB'),
-    ('/oak/imu/data',               Imu,        150.0, 'IMU OAK-S2'),
-    ('/oak/stereo/image_raw',       Image,       15.0, 'Camera Depth'),
-    ('/rtabmap/odom',               Odometry,     8.0, 'Odometrie vizuala'),
-    ('/odometry/filtered',          Odometry,    40.0, 'Odometrie EKF'),
-    ('/mavros/local_position/pose', PoseStamped, 20.0, 'Pozitie locala PX4'),
+    ('/oak/rgb/image_raw',          Image,       15.0, 'RGB Camera'),
+    ('/oak/imu/data',               Imu,        150.0, 'OAK-S2 IMU'),
+    ('/oak/stereo/image_raw',       Image,       15.0, 'Depth Camera'),
+    ('/rtabmap/odom',               Odometry,     8.0, 'Visual Odometry'),
+    ('/odometry/filtered',          Odometry,    40.0, 'EKF Odometry'),
+    ('/mavros/local_position/pose', PoseStamped, 20.0, 'PX4 Local Position'),
 ]
 
 
@@ -58,7 +58,7 @@ class TopicChecker(Node):
             depth=10
         )
 
-        # Creeaza subscriber pentru fiecare topic
+        # Create a subscriber for each topic to monitor
         self.subscribers = []
         for topic, msg_type, _, _ in TOPICS_TO_CHECK:
             sub = self.create_subscription(
@@ -68,16 +68,16 @@ class TopicChecker(Node):
             )
             self.subscribers.append(sub)
 
-        # Subscriber special pentru starea MAVROS (nu frecventa, ci boolean)
+        # Special subscriber for MAVROS state (boolean check, not frequency)
         self.mavros_connected = False
         self.mavros_sub = self.create_subscription(
             State, '/mavros/state',
             self.mavros_callback, 10
         )
 
-        # Timer: afiseaza raport dupa 5 secunde
+        # Timer: print report after 5 seconds of monitoring
         self.timer = self.create_timer(5.0, self.print_report)
-        self.get_logger().info('Verific topic-urile timp de 5 secunde...')
+        self.get_logger().info('Monitoring topics for 5 seconds...')
 
     def callback(self, topic_name: str):
         self.counts[topic_name] += 1
@@ -88,7 +88,7 @@ class TopicChecker(Node):
     def print_report(self):
         elapsed = time.time() - self.start_time
         print('\n' + '═' * 65)
-        print('  RAPORT VERIFICARE SISTEM VISUAL SLAM')
+        print('  VISUAL SLAM SYSTEM CHECK REPORT')
         print('═' * 65)
 
         all_ok = True
@@ -104,20 +104,20 @@ class TopicChecker(Node):
             print(f'  {icon}  {desc:<25} {actual_hz:6.1f} Hz'
                   f'  (min: {min_hz:.0f} Hz)  [{topic}]')
 
-        # Verificare speciala MAVROS
+        # Special MAVROS connection check
         mavros_icon = '✅' if self.mavros_connected else '❌'
-        print(f'  {mavros_icon}  {"MAVROS conectat":<25} '
-              f'{"Da" if self.mavros_connected else "Nu":<10}'
+        print(f'  {mavros_icon}  {"MAVROS connected":<25} '
+              f'{"Yes" if self.mavros_connected else "No":<10}'
               f'  [/mavros/state]')
 
         print('═' * 65)
         if all_ok and self.mavros_connected:
-            print('  ✅ SISTEM OK — gata de zbor')
+            print('  ✅ SYSTEM OK — ready for flight')
         else:
-            print('  ⚠️  PROBLEME DETECTATE — nu zbura inca!')
+            print('  ⚠️  ISSUES DETECTED — do not fly yet!')
         print('═' * 65 + '\n')
 
-        # Opreste nodul dupa raport
+        # Shut down the node after printing the report
         raise SystemExit
 
 

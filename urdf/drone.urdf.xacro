@@ -1,39 +1,40 @@
 <?xml version="1.0"?>
 <!--
-  URDF (Unified Robot Description Format) — Descrierea cinematica a dronei
-  =========================================================================
-  Acest fisier defineste "TF Tree" — arborele de transformari spatiale
-  dintre componentele dronei. ROS2 foloseste TF pentru a sti unde se afla
-  fiecare senzor relativ la centrul robotului (base_link).
+  URDF (Unified Robot Description Format) — Drone Kinematic Description
+  ======================================================================
+  This file defines the "TF Tree" — the tree of spatial transformations
+  between the drone's components. ROS2 uses TF to know where each sensor
+  is located relative to the robot's center (base_link).
 
-  Pentru o drona, arborele arata asa:
-    base_link (centrul de masa)
-        └── oak_camera_frame (camera OAK-S2)
-                ├── oak_rgb_camera_frame     (senzor RGB)
-                ├── oak_left_camera_frame    (camera stereo stanga)
-                └── oak_right_camera_frame   (camera stereo dreapta)
+  For this drone, the transform tree looks like this:
+    base_link (center of mass)
+        └── oak_camera_frame (OAK-S2 camera body)
+                ├── oak_rgb_camera_frame     (RGB sensor)
+                ├── oak_left_camera_frame    (left stereo camera)
+                └── oak_right_camera_frame   (right stereo camera)
 
-  IMPORTANT: Valorile xyz si rpy din jointul "base_to_camera" trebuie
-  masurate fizic dupa ce montezi camera pe drona!
-  Sistem de coordonate ROS (REP-103):
-    x = inainte
-    y = stanga
-    z = sus
-    rpy = (roll, pitch, yaw) in radiani
+  IMPORTANT: The xyz and rpy values in the "base_to_camera" joint MUST
+  be physically measured after mounting the camera on the drone!
 
-  Exemplu: camera montata 5cm in fata, 2cm sus, orientata inainte:
+  ROS coordinate system (REP-103):
+    x = forward
+    y = left
+    z = up
+    rpy = (roll, pitch, yaw) in radians
+
+  Example: camera mounted 5cm forward, 2cm up, facing forward:
     <origin xyz="0.05 0.0 0.02" rpy="0.0 0.0 0.0"/>
 -->
 <robot name="s500_drone" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
   <!-- ============================================================
-    BASE LINK — Centrul de masa al dronei
-    Acesta este frame-ul de referinta principal.
-    Toate celelalte componente sunt definite relativ la acesta.
+    BASE LINK — Drone center of mass
+    This is the primary reference frame.
+    All other components are defined relative to this frame.
   ============================================================ -->
   <link name="base_link">
     <inertial>
-      <!-- Masa aproximativa a dronei S500 V2 fara baterie: ~1.5kg -->
+      <!-- Approximate drone mass without battery: ~1.5 kg (HolyBro S500 V2) -->
       <mass value="1.5"/>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <inertia ixx="0.029" ixy="0" ixz="0"
@@ -43,33 +44,34 @@
   </link>
 
   <!-- ============================================================
-    CAMERA OAK-S2
-    AJUSTEAZA valorile xyz dupa montajul fizic real!
-    Masoara cu o rigla distanta de la centrul de masa al dronei
-    pana la centrul optic al camerei.
+    OAK-S2 CAMERA
+    ADJUST the xyz values to match the actual physical mounting!
+    Measure with a ruler from the drone's center of mass to the
+    camera's optical center.
   ============================================================ -->
   <joint name="base_to_oak_camera" type="fixed">
     <parent link="base_link"/>
     <child link="oak_camera_frame"/>
     <!--
-      xyz: offset in metri (x=inainte, y=stanga, z=sus)
-      rpy: rotatie in radiani (roll, pitch, yaw)
-      Valorile de mai jos = camera montata 5cm in fata, 2cm sus
-      cu orientare inainte (parallel cu axa dronei)
+      xyz: offset in meters (x=forward, y=left, z=up)
+      rpy: rotation in radians (roll, pitch, yaw)
+      Values below = camera mounted 5cm forward, 2cm up,
+      facing forward (parallel to drone axis)
+      ⚠️  MEASURE AND UPDATE THESE VALUES BEFORE FIRST FLIGHT!
     -->
     <origin xyz="0.05 0.0 0.02" rpy="0.0 0.0 0.0"/>
   </joint>
 
   <link name="oak_camera_frame">
     <inertial>
-      <!-- Masa OAK-S2: ~72g -->
+      <!-- OAK-S2 mass: ~72g -->
       <mass value="0.072"/>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <inertia ixx="0.0001" ixy="0" ixz="0"
                iyy="0.0001" iyz="0"
                izz="0.0001"/>
     </inertial>
-    <!-- Model vizual simplificat (cutie) pentru RViz -->
+    <!-- Simplified box geometry for RViz visualization -->
     <visual>
       <geometry>
         <box size="0.097 0.024 0.023"/>
@@ -81,14 +83,14 @@
   </link>
 
   <!-- ============================================================
-    IMU VIRTUAL
-    IMU-ul OAK-S2 este co-localizat cu camera.
-    Acest joint este necesar pentru RTAB-Map (wait_imu_to_init).
+    VIRTUAL IMU FRAME
+    The OAK-S2 IMU is co-located with the camera body.
+    This joint is required by RTAB-Map (wait_imu_to_init parameter).
   ============================================================ -->
   <joint name="oak_to_imu" type="fixed">
     <parent link="oak_camera_frame"/>
     <child link="oak_imu_frame"/>
-    <!-- IMU-ul este integrat in camera, offset neglijabil -->
+    <!-- IMU is integrated inside the camera — negligible offset -->
     <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
   </joint>
 

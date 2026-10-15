@@ -1,34 +1,33 @@
 #!/usr/bin/env python3
 """
-Nod ROS2: vision_to_mavros.py
+ROS2 Node: vision_to_mavros.py
 ================================
-Acest nod face bridge-ul intre odometria vizuala (EKF output) si MAVROS.
+This node bridges visual odometry (EKF output) to MAVROS.
 
-PROBLEMA PE CARE O REZOLVA:
-  MAVROS asteapta pozitia vizuala pe topic-ul /mavros/vision_pose/pose
-  de tip geometry_msgs/PoseStamped.
-  EKF-ul nostru publica pe /odometry/filtered de tip nav_msgs/Odometry.
-  Cele doua tipuri sunt diferite, deci avem nevoie de un nod de conversie.
+PROBLEM IT SOLVES:
+  MAVROS expects the visual position estimate on the topic
+  /mavros/vision_pose/pose with type geometry_msgs/PoseStamped.
+  Our EKF publishes on /odometry/filtered with type nav_msgs/Odometry.
+  These are different message types, so a conversion node is needed.
 
-DE CE E IMPORTANT:
-  Pixhawk 6C Mini ruleaza intern un EKF2 (Extended Kalman Filter v2).
-  Cand ii trimitem pozitia vizuala, PX4 o fuzioneza cu:
-    - Barometrul (altitudine)
-    - IMU-ul intern (accelerometru + giroscop)
-    - GPS (daca e disponibil)
-  Rezultatul este o estimare de pozitie mult mai robusta decat oricare
-  senzor singur.
+WHY THIS IS IMPORTANT:
+  The Pixhawk 6C Mini runs an internal EKF2 (Extended Kalman Filter v2).
+  When we send it the visual position, PX4 fuses it with:
+    - Barometer (altitude)
+    - Internal IMU (accelerometer + gyroscope)
+    - GPS (if available)
+  The result is a position estimate far more robust than any single sensor.
 
-  Parametrii EKF2 relevanti in QGroundControl:
-    EKF2_EV_CTRL = 15  (activeaza sursa vizuala pentru x,y,z,yaw)
-    EKF2_HGT_REF = 3   (altitudinea vine din vision, nu din baro)
+  Relevant EKF2 parameters to set in QGroundControl:
+    EKF2_EV_CTRL = 15  (enable visual source for x, y, z, yaw)
+    EKF2_HGT_REF = 3   (altitude comes from vision, not barometer)
 
-FRECVENTA:
-  Trimitem la 30Hz — suficient pentru PX4, fara a supraincarca serialul.
+PUBLISH RATE:
+  Publishes at 30 Hz — sufficient for PX4, without overloading the serial link.
 
-Cum se porneste:
+How to start:
   ros2 run drone_slam vision_to_mavros.py
-  (sau automat din slam_full.launch.py)
+  (or automatically via slam_full.launch.py)
 """
 
 import rclpy
@@ -41,60 +40,60 @@ from geometry_msgs.msg import PoseStamped
 
 class VisionToMavros(Node):
     """
-    Converteste nav_msgs/Odometry → geometry_msgs/PoseStamped
-    si publica pe /mavros/vision_pose/pose.
+    Converts nav_msgs/Odometry → geometry_msgs/PoseStamped
+    and publishes to /mavros/vision_pose/pose.
     """
 
     def __init__(self):
         super().__init__('vision_to_mavros')
 
         # ── QoS Profile ────────────────────────────────────────────
-        # BEST_EFFORT: nu blocam daca un mesaj se pierde (real-time priority)
+        # BEST_EFFORT: do not block if a message is lost (real-time priority)
         qos_best_effort = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=10
         )
 
-        # ── Subscriber: odometria filtrata de la EKF ───────────────
+        # ── Subscriber: filtered odometry from EKF ─────────────────
         self.odom_sub = self.create_subscription(
             Odometry,
-            '/odometry/filtered',       # output-ul EKF
+            '/odometry/filtered',       # EKF output topic
             self.odom_callback,
             qos_best_effort
         )
 
-        # ── Publisher: pozitia vizuala catre MAVROS/Pixhawk ─────────
+        # ── Publisher: visual pose to MAVROS/Pixhawk ────────────────
         self.vision_pub = self.create_publisher(
             PoseStamped,
-            '/mavros/vision_pose/pose', # MAVROS asculta pe acest topic
+            '/mavros/vision_pose/pose', # MAVROS listens on this topic
             10
         )
 
         self.get_logger().info(
-            'VisionToMavros pornit. '
-            'Ascult /odometry/filtered → public /mavros/vision_pose/pose'
+            'VisionToMavros node started. '
+            'Subscribing to /odometry/filtered → publishing /mavros/vision_pose/pose'
         )
 
     def odom_callback(self, msg: Odometry):
         """
-        Callback apelat la fiecare mesaj Odometry de la EKF.
-        Extrage pozitia si orientarea si le publica ca PoseStamped.
+        Callback invoked on every Odometry message from the EKF.
+        Extracts position and orientation and publishes them as PoseStamped.
         """
         pose_stamped = PoseStamped()
 
-        # Pastreaza timestamp-ul original (important pentru PX4!)
-        # PX4 foloseste timestamp-ul pentru a estima latenta senzorului
+        # Preserve the original timestamp (critical for PX4!)
+        # PX4 uses the timestamp to estimate the sensor pipeline latency
         pose_stamped.header = msg.header
-        pose_stamped.header.frame_id = 'map'  # frame global
+        pose_stamped.header.frame_id = 'map'  # global reference frame
 
-        # Copiaza pozitia (x, y, z in metri)
+        # Copy position (x, y, z in meters)
         pose_stamped.pose.position = msg.pose.pose.position
 
-        # Copiaza orientarea (quaternion: x, y, z, w)
+        # Copy orientation (quaternion: x, y, z, w)
         pose_stamped.pose.orientation = msg.pose.pose.orientation
 
-        # Publica catre MAVROS
+        # Publish to MAVROS
         self.vision_pub.publish(pose_stamped)
 
 
@@ -106,7 +105,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Nod oprit de utilizator.')
+        node.get_logger().info('Node stopped by user.')
     finally:
         node.destroy_node()
         rclpy.shutdown()

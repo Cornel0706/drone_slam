@@ -1,92 +1,93 @@
 # ============================================================
-#  Configurare RTAB-Map — parametri optimizati pentru drona
-#  Documentatie: https://github.com/introlab/rtabmap_ros
+#  RTAB-Map Configuration — parameters optimized for drone use
+#  Documentation: https://github.com/introlab/rtabmap_ros
 #
-#  RTAB-Map (Real-Time Appearance-Based Mapping) este un sistem
-#  SLAM care foloseste imagini RGB-D pentru:
-#    1. Odometrie vizuala (estimare pozitie locala)
-#    2. Loop closure (recunoastere zone vizitate anterior)
-#    3. Construire harta 3D (point cloud + ocupancy grid)
+#  RTAB-Map (Real-Time Appearance-Based Mapping) is a SLAM system
+#  that uses RGB-D images for:
+#    1. Visual odometry (local position estimation)
+#    2. Loop closure (recognizing previously visited areas)
+#    3. 3D map building (point cloud + occupancy grid)
 #
-#  Sunt doi noduri principale:
-#    - rtabmap_odom::RGBDOdometry  → odometrie rapida (frontend)
-#    - rtabmap_slam::Rtabmap       → SLAM complet (backend)
+#  Two main nodes:
+#    - rtabmap_odom::RGBDOdometry  → fast visual odometry (SLAM frontend)
+#    - rtabmap_slam::Rtabmap       → full SLAM with loop closure (backend)
 # ============================================================
 
-# ── Nod odometrie vizuala (RGBDOdometry) ──────────────────────
+# ── Visual Odometry Node (RGBDOdometry) ───────────────────────
 rgbd_odometry_node:
   ros__parameters:
-    # Frame-ul robotului (centrul dronei)
+    # The robot's body frame (drone center of mass)
     frame_id: "base_link"
 
-    # Frame-ul odometriei (fix la start)
+    # The odometry frame (fixed at startup position)
     odom_frame_id: "odom"
 
-    # Sincronizare aproximativa a topic-urilor (camerele nu sunt perfect sincrone)
+    # Approximate topic synchronization (camera topics are not perfectly synced)
     approx_sync: true
 
-    # Interval maxim de sincronizare (ms) — 20ms pentru 20fps
+    # Maximum sync interval (seconds) — 20ms for 20fps camera
     approx_sync_max_interval: 0.02
 
-    # Asteapta IMU-ul pentru initializare orientare (important pentru drona)
+    # Wait for IMU before initializing orientation (important for drones)
     wait_imu_to_init: true
 
-    # ── Strategia de odometrie ──────────────────────────────
-    # "0" = Frame-to-Map (mai robust, recomandant pentru drone)
-    # "1" = Frame-to-Frame (mai rapid, mai drift)
+    # ── Odometry Strategy ───────────────────────────────────
+    # "0" = Frame-to-Map (more robust, recommended for drones)
+    # "1" = Frame-to-Frame (faster, but more drift)
     Odom/Strategy: "0"
 
-    # Detectia caracteristicilor vizuale (keypoints)
-    # GFTT = Good Features to Track (Harris + Shi-Tomasi)
-    Vis/FeatureType: "6"        # GFTT
-    GFTT/MinDistance: "5"       # distanta minima intre keypoints (px)
-    GFTT/QualityLevel: "0.001"  # prag calitate keypoint
+    # Visual feature detection (keypoints)
+    # GFTT = Good Features to Track (Harris + Shi-Tomasi corners)
+    Vis/FeatureType: "6"        # GFTT detector
+    GFTT/MinDistance: "5"       # minimum distance between keypoints (pixels)
+    GFTT/QualityLevel: "0.001"  # keypoint quality threshold
 
-    # Minim 10 puncte comune pentru estimare valida
+    # Minimum number of matched points for a valid motion estimate
     Vis/MinInliers: "10"
 
-    # Distanta maxima admisa pentru inlier (in metrie)
+    # Maximum allowed inlier reprojection distance (in meters)
     Vis/InlierDistance: "0.1"
 
-    # Dimensiunea maxima a hartii locale (frame-to-map)
+    # Maximum size of the local keyframe map (Frame-to-Map)
     OdomF2M/MaxSize: "1000"
 
-# ── Nod SLAM complet (Rtabmap) ─────────────────────────────────
+# ── Full SLAM Node (Rtabmap backend) ──────────────────────────
 rtabmap_node:
   ros__parameters:
     frame_id: "base_link"
 
-    # Abonare la RGB + Depth separat (nu RGBD combinat)
+    # Subscribe to RGB + Depth separately (not as a combined RGBD stream)
     subscribe_rgb: true
     subscribe_depth: true
 
-    # Primeste si info de la odometrie (covariance)
+    # Also receive odometry covariance info from the odometry node
     subscribe_odom_info: true
 
-    # Sincronizare aproximativa
+    # Approximate synchronization between topics
     approx_sync: true
 
-    # Memorie incrementala: adauga noi locatii in memorie continuu
+    # Incremental memory: continuously adds new locations to memory (mapping mode)
+    # Set to "false" for localization-only mode (no new nodes added)
     Mem/IncrementalMemory: "true"
 
-    # Nu initia memoria cu toate nodurile (start fresh)
+    # Do not pre-populate working memory with all nodes at startup (fresh start)
     Mem/InitWMWithAllNodes: "false"
 
-    # Loop closure prin proximitate spatiala (nu doar vizuala)
+    # Spatial loop closure in addition to visual loop closure
     RGBD/ProximityBySpace: "true"
 
-    # Update harta doar la miscari semnificative (economisire CPU)
-    # Linear: 1cm minim inainte de update
+    # Update the map only on significant motion (saves CPU on drone)
+    # Linear: at least 1cm of movement before updating
     RGBD/LinearUpdate: "0.01"
-    # Unghiular: ~0.57 grade minim
+    # Angular: at least ~0.57 degrees of rotation before updating
     RGBD/AngularUpdate: "0.01"
 
-    # Limita de timp per iteratie SLAM (ms)
-    # 700ms = ~1.4Hz pentru backend (ok, odometria e mai rapida)
+    # Maximum time budget per SLAM backend iteration (milliseconds)
+    # 700ms = ~1.4 Hz for backend (acceptable — odometry runs much faster)
     Rtabmap/TimeThr: "700"
 
-    # Maxim 400 caracteristici per imagine (CPu vs precizie)
+    # Maximum number of visual features per image (CPU vs. accuracy trade-off)
     Kp/MaxFeatures: "400"
 
-    # Detectie loop closure bazata pe vocabular vizual (Bag of Words)
-    Kp/DetectorStrategy: "6"   # GFTT (consistent cu odometria)
+    # Loop closure detection using a visual vocabulary (Bag of Words)
+    Kp/DetectorStrategy: "6"   # GFTT (consistent with odometry node)
