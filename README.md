@@ -109,9 +109,17 @@ source ~/drone_ws/install/setup.bash
 ros2 launch drone_sim sim_slam.launch.py
 ```
 
+> [!IMPORTANT]
+> **Takeoff Step (Work in Progress):**  
+> While autonomous takeoff directly from Python is currently being refined, you must manually trigger takeoff from **Terminal 1** (the PX4 SITL console) right after starting Terminal 2:
+> ```bash
+> commander takeoff
+> ```
+> Wait a few seconds until the drone completes its ascent and stabilizes in hover (~2.5 m) before proceeding to Terminal 3.
+
 #### Terminal 3 — Autonomous Mapping Routine
 Executes the automated mapping sequence (`auto_mapper.py`):
-1. Arms the drone and performs automatic takeoff to 2.0 m.
+1. Detects the airborne drone at hover altitude.
 2. Streams continuous zero-velocity setpoints and smoothly transitions into `OFFBOARD` mode.
 3. Performs a discretized 360° panoramic scan (step-and-pause) to build feature correspondences.
 4. Executes an ultra-smooth survey flight with real-time odometry quality feedback.
