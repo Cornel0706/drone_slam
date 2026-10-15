@@ -1,12 +1,26 @@
-# Python
+# Python bytecode & cache
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
 
-# RTAB-Map databases
+# RTAB-Map databases & map dumps
 *.db
+*.db-journal
 
-# Build & editors
-*.swp
-*~
+# Flight logs & simulator recordings
+*.ulg
+*.log
+
+# ROS 2 workspace artifacts (if built inside repo)
+build/
+install/
+log/
+
+# System & editor files
 .DS_Store
+*~
+*.swp
+*.bak
+.vscode/
+.idea/

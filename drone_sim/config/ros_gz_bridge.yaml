@@ -1,0 +1,38 @@
+# ============================================================
+#  ros_gz_bridge configuration
+#  Bridges Gazebo Harmonic topics to ROS 2 Jazzy topics
+# ============================================================
+
+# Clock synchronization
+- ros_topic_name: "/clock"
+  gz_topic_name: "/clock"
+  ros_type_name: "rosgraph_msgs/msg/Clock"
+  gz_type_name: "gz.msgs.Clock"
+  direction: GZ_TO_ROS
+
+# RGB Camera
+- ros_topic_name: "/oak/rgb/image_raw"
+  gz_topic_name: "/camera"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/oak/rgb/camera_info"
+  gz_topic_name: "/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# Stereo Depth Camera
+- ros_topic_name: "/oak/stereo/image_raw"
+  gz_topic_name: "/depth_camera"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+# IMU from drone model in Gazebo (x500_depth_0)
+- ros_topic_name: "/oak/imu/data"
+  gz_topic_name: "/world/drone_slam_world/model/x500_depth_0/link/base_link/sensor/imu_sensor/imu"
+  ros_type_name: "sensor_msgs/msg/Imu"
+  gz_type_name: "gz.msgs.IMU"
+  direction: GZ_TO_ROS

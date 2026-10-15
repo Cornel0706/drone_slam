@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>drone_sim</name>
+  <version>1.0.0</version>
+  <description>
+    Simulation package for autonomous drone Visual SLAM using Gazebo Harmonic,
+    PX4 SITL, and ROS 2 Jazzy. Contains simulation worlds, bridge configurations,
+    and launch files to validate the drone_slam stack on PC before physical deployment.
+  </description>
+
+  <maintainer email="your_email@example.com">Cornel</maintainer>
+  <license>MIT</license>
+
+  <!-- Build tool dependencies -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- ROS2 / Gazebo Bridge dependencies -->
+  <exec_depend>rclcpp</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>ros_gz_image</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+
+  <!-- Core SLAM stack dependency -->
+  <exec_depend>drone_slam</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

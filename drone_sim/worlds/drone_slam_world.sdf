@@ -1,0 +1,559 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="drone_slam_world">
+    <!-- Physics engine -->
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.004</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- Essential Gazebo Harmonic plugins -->
+    <plugin
+      filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+    <plugin
+      filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+    <plugin
+      filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+    <plugin
+      filename="gz-sim-sensors-system"
+      name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin
+      filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
+    </plugin>
+    <plugin
+      filename="gz-sim-air-pressure-system"
+      name="gz::sim::systems::AirPressure">
+    </plugin>
+    <plugin
+      filename="gz-sim-contact-system"
+      name="gz::sim::systems::Contact">
+    </plugin>
+    <plugin
+      filename="gz-sim-apply-link-wrench-system"
+      name="gz::sim::systems::ApplyLinkWrench">
+    </plugin>
+    <plugin
+      filename="gz-sim-navsat-system"
+      name="gz::sim::systems::NavSat">
+    </plugin>
+
+    <gravity>0 0 -9.8</gravity>
+    <magnetic_field>6e-06 2.3e-05 -4.2e-05</magnetic_field>
+    <atmosphere type="adiabatic"/>
+
+    <spherical_coordinates>
+      <surface_model>EARTH_WGS84</surface_model>
+      <world_frame_orientation>ENU</world_frame_orientation>
+      <latitude_deg>47.397971057728974</latitude_deg>
+      <longitude_deg>8.546163739800146</longitude_deg>
+      <elevation>0</elevation>
+    </spherical_coordinates>
+
+    <!-- Sun / Lighting -->
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 20 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- Ground Plane with checkered visual pattern for feature tracking -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>50 50</size></plane></geometry>
+          <surface><friction><ode><mu>100</mu><mu2>50</mu2></ode></friction></surface>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>50 50</size></plane></geometry>
+          <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/floor.png</albedo_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+
+
+    <!-- Landmark Structures & Rich SLAM Environment -->
+    <!-- Floor Pattern / Grid Markers for Ground Feature Tracking -->
+    <model name="tile_-4_-4">
+      <static>true</static>
+      <pose>-4 -4 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_-4_-2">
+      <static>true</static>
+      <pose>-4 -2 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_-4_0">
+      <static>true</static>
+      <pose>-4 0 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_-4_2">
+      <static>true</static>
+      <pose>-4 2 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_-4_4">
+      <static>true</static>
+      <pose>-4 4 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_-2_-4">
+      <static>true</static>
+      <pose>-2 -4 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_-2_-2">
+      <static>true</static>
+      <pose>-2 -2 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_-2_0">
+      <static>true</static>
+      <pose>-2 0 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_-2_2">
+      <static>true</static>
+      <pose>-2 2 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_-2_4">
+      <static>true</static>
+      <pose>-2 4 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_0_-4">
+      <static>true</static>
+      <pose>0 -4 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_0_-2">
+      <static>true</static>
+      <pose>0 -2 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_0_0">
+      <static>true</static>
+      <pose>0 0 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_0_2">
+      <static>true</static>
+      <pose>0 2 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_0_4">
+      <static>true</static>
+      <pose>0 4 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_2_-4">
+      <static>true</static>
+      <pose>2 -4 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_2_-2">
+      <static>true</static>
+      <pose>2 -2 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_2_0">
+      <static>true</static>
+      <pose>2 0 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_2_2">
+      <static>true</static>
+      <pose>2 2 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_2_4">
+      <static>true</static>
+      <pose>2 4 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_4_-4">
+      <static>true</static>
+      <pose>4 -4 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_4_-2">
+      <static>true</static>
+      <pose>4 -2 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_4_0">
+      <static>true</static>
+      <pose>4 0 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_4_2">
+      <static>true</static>
+      <pose>4 2 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.75 0.75 0.7 1</ambient><diffuse>0.75 0.75 0.7 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="tile_4_4">
+      <static>true</static>
+      <pose>4 4 0.005 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>1.6 1.6 0.01</size></box></geometry>
+        <material><ambient>0.2 0.2 0.25 1</ambient><diffuse>0.2 0.2 0.25 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="pillar_north">
+      <static>true</static>
+      <pose>3.5 0 2.75 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.8 0.8 5.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.8 0.8 5.5</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/pillar.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="pillar_east">
+      <static>true</static>
+      <pose>0 3.5 2.75 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.8 0.8 5.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.8 0.8 5.5</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/pillar.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="pillar_south">
+      <static>true</static>
+      <pose>-3.5 0 2.75 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.8 0.8 5.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.8 0.8 5.5</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/pillar.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="pillar_west">
+      <static>true</static>
+      <pose>0 -3.5 2.75 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.8 0.8 5.5</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.8 0.8 5.5</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/pillar.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="tower_ne">
+      <static>true</static>
+      <pose>4.5 4.5 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>1.2 1.2 5.0</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>1.2 1.2 5.0</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/wall.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="tower_nw">
+      <static>true</static>
+      <pose>4.5 -4.5 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>1.2 1.2 5.0</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>1.2 1.2 5.0</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/wall.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="tower_se">
+      <static>true</static>
+      <pose>-4.5 4.5 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>1.2 1.2 5.0</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>1.2 1.2 5.0</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/wall.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="tower_sw">
+      <static>true</static>
+      <pose>-4.5 -4.5 2.5 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>1.2 1.2 5.0</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>1.2 1.2 5.0</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/wall.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="wall_north">
+      <static>true</static>
+      <pose>8.0 0 3.0 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.3 16.0 6.0</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.3 16.0 6.0</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/wall.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="wall_south">
+      <static>true</static>
+      <pose>-8.0 0 3.0 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.3 16.0 6.0</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.3 16.0 6.0</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/wall.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="wall_east">
+      <static>true</static>
+      <pose>0 8.0 3.0 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>16.0 0.3 6.0</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>16.0 0.3 6.0</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/wall.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="wall_west">
+      <static>true</static>
+      <pose>0 -8.0 3.0 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>16.0 0.3 6.0</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>16.0 0.3 6.0</size></box></geometry>
+        <material>
+            <diffuse>1.0 1.0 1.0 1.0</diffuse>
+            <pbr>
+              <metal>
+                <albedo_map>/home/cornel/drone_ws/src/drone_sim/worlds/textures/wall.png</albedo_map>
+              </metal>
+            </pbr>
+          </material></visual>
+      </link>
+    </model>
+    <model name="banner_north_mid">
+      <static>true</static>
+      <pose>7.8 0 3.0 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>0.1 12.0 0.6</size></box></geometry>
+        <material><ambient>0.9 0.6 0.1 1</ambient><diffuse>0.9 0.6 0.1 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="banner_north_top">
+      <static>true</static>
+      <pose>7.8 0 4.8 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>0.1 14.0 0.4</size></box></geometry>
+        <material><ambient>0.2 0.7 0.9 1</ambient><diffuse>0.2 0.7 0.9 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="banner_south_mid">
+      <static>true</static>
+      <pose>-7.8 0 3.0 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>0.1 12.0 0.6</size></box></geometry>
+        <material><ambient>0.9 0.2 0.3 1</ambient><diffuse>0.9 0.2 0.3 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="banner_south_top">
+      <static>true</static>
+      <pose>-7.8 0 4.8 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>0.1 14.0 0.4</size></box></geometry>
+        <material><ambient>0.3 0.8 0.3 1</ambient><diffuse>0.3 0.8 0.3 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="banner_east_mid">
+      <static>true</static>
+      <pose>0 7.8 3.0 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>12.0 0.1 0.6</size></box></geometry>
+        <material><ambient>0.8 0.8 0.2 1</ambient><diffuse>0.8 0.8 0.2 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="banner_east_top">
+      <static>true</static>
+      <pose>0 7.8 4.8 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>14.0 0.1 0.4</size></box></geometry>
+        <material><ambient>0.9 0.4 0.8 1</ambient><diffuse>0.9 0.4 0.8 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="banner_west_mid">
+      <static>true</static>
+      <pose>0 -7.8 3.0 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>12.0 0.1 0.6</size></box></geometry>
+        <material><ambient>0.2 0.8 0.6 1</ambient><diffuse>0.2 0.8 0.6 1</diffuse></material></visual>
+      </link>
+    </model>
+    <model name="banner_west_top">
+      <static>true</static>
+      <pose>0 -7.8 4.8 0 0 0</pose>
+      <link name="link">
+        <visual name="vis"><geometry><box><size>14.0 0.1 0.4</size></box></geometry>
+        <material><ambient>0.8 0.5 0.2 1</ambient><diffuse>0.8 0.5 0.2 1</diffuse></material></visual>
+      </link>
+    </model>
+  </world>
+</sdf>
