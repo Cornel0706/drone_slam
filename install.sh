@@ -51,14 +51,19 @@ if [ "$OS" != "24.04" ]; then
 fi
 
 # ── Swap configuration (4GB required for compilation) ────────────────
-info "Configuring 4GB swap (required for colcon build on RPi5)..."
+info "Checking swap space (4GB recommended for colcon build on RPi5)..."
 SWAP_SIZE=$(free -m | awk '/^Swap:/{print $2}')
-if [ "$SWAP_SIZE" -lt 2048 ]; then
-    sudo dphys-swapfile swapoff 2>/dev/null || true
-    sudo sed -i 's/CONF_SWAPSIZE=.*/CONF_SWAPSIZE=4096/' /etc/dphys-swapfile
-    sudo dphys-swapfile setup
-    sudo dphys-swapfile swapon
-    success "Swap configured to 4GB"
+if [ -z "$SWAP_SIZE" ] || [ "$SWAP_SIZE" -lt 3500 ]; then
+    info "Setting up 4GB swapfile..."
+    sudo swapoff /swapfile 2>/dev/null || true
+    sudo fallocate -l 4G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
+    if ! grep -q '/swapfile' /etc/fstab; then
+        echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+    fi
+    success "4GB swap configured"
 else
     success "Swap is sufficient ($SWAP_SIZE MB)"
 fi
@@ -127,7 +132,7 @@ success "ROS2 packages installed"
 
 # ── OAK-S2 camera driver (depthai-ros) ───────────────────────────────
 info "Installing OAK-S2 driver (depthai-ros)..."
-if sudo apt install -y ros-jazzy-depthai-ros 2>/dev/null; then
+if sudo apt install -y ros-jazzy-depthai-ros ros-jazzy-depthai-ros-driver 2>/dev/null; then
     success "depthai-ros installed from binary packages"
 else
     warn "Binary packages not available. Building from source..."
@@ -141,17 +146,24 @@ fi
 # ── GeographicLib datasets for MAVROS ────────────────────────────────
 info "Installing GeographicLib datasets (required by MAVROS)..."
 if [ ! -f /usr/share/GeographicLib/geoids/egm96-5.pgm ]; then
-    wget -q https://raw.githubusercontent.com/mavlink/mavros/ros2/mavros/scripts/install_geographiclib_datasets.sh
-    sudo bash install_geographiclib_datasets.sh
-    rm -f install_geographiclib_datasets.sh
+    if [ -f /opt/ros/jazzy/lib/mavros/install_geographiclib_datasets.sh ]; then
+        sudo /opt/ros/jazzy/lib/mavros/install_geographiclib_datasets.sh
+    else
+        wget -q https://raw.githubusercontent.com/mavlink/mavros/ros2/mavros/scripts/install_geographiclib_datasets.sh
+        sudo bash install_geographiclib_datasets.sh
+        rm -f install_geographiclib_datasets.sh
+    fi
     success "GeographicLib datasets installed"
 else
     success "GeographicLib datasets already installed"
 fi
 
+# ── Ensure Python scripts are executable ──────────────────────────────
+WORKSPACE_DIR=$(dirname $(dirname $(realpath "$0")))
+chmod +x "$WORKSPACE_DIR"/src/drone_slam/scripts/*.py 2>/dev/null || true
+
 # ── Build the workspace ───────────────────────────────────────────────
 info "Building ROS2 workspace (may take 10-20 minutes on RPi5)..."
-WORKSPACE_DIR=$(dirname $(dirname $(realpath "$0")))
 cd "$WORKSPACE_DIR"
 
 rosdep init 2>/dev/null || true
@@ -172,14 +184,20 @@ if ! grep -q "$WORKSPACE_SETUP" ~/.bashrc; then
 fi
 
 # ── Enable GPIO UART for Pixhawk connection ───────────────────────────
-info "Enabling GPIO UART for Pixhawk (TELEM2 → RPi5 GPIO)..."
-if ! grep -q "enable_uart=1" /boot/firmware/config.txt 2>/dev/null; then
-    echo "" | sudo tee -a /boot/firmware/config.txt
-    echo "# UART for Pixhawk 6C Mini" | sudo tee -a /boot/firmware/config.txt
-    echo "enable_uart=1" | sudo tee -a /boot/firmware/config.txt
-    echo "dtoverlay=disable-bt" | sudo tee -a /boot/firmware/config.txt
-    warn "UART configured — REBOOT REQUIRED!"
+info "Configuring UART for Pixhawk (TELEM2 → RPi5 GPIO)..."
+CONFIG_PATH="/boot/firmware/config.txt"
+if [ -f "$CONFIG_PATH" ]; then
+    if ! grep -q "dtparam=uart0=on" "$CONFIG_PATH"; then
+        echo "" | sudo tee -a "$CONFIG_PATH"
+        echo "# UART for Pixhawk 6C Mini" | sudo tee -a "$CONFIG_PATH"
+        echo "enable_uart=1" | sudo tee -a "$CONFIG_PATH"
+        echo "dtparam=uart0=on" | sudo tee -a "$CONFIG_PATH"
+        warn "UART configured in $CONFIG_PATH — REBOOT REQUIRED!"
+    fi
 fi
+# Disable serial console login on ttyAMA0 so it doesn't collide with MAVROS
+sudo systemctl stop serial-getty@ttyAMA0.service 2>/dev/null || true
+sudo systemctl disable serial-getty@ttyAMA0.service 2>/dev/null || true
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"

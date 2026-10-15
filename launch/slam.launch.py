@@ -34,28 +34,61 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import Command, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     pkg = get_package_share_directory('drone_slam')
+    rtabmap_params_file = os.path.join(pkg, 'config', 'rtabmap_params.yaml')
+    ekf_params_file = os.path.join(pkg, 'config', 'ekf_params.yaml')
+    urdf_file = os.path.join(pkg, 'urdf', 'drone.urdf.xacro')
 
     # ── Configurable arguments ───────────────────────────────────────
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='Use simulation (Gazebo) clock if true'
+    )
+
     localization_mode_arg = DeclareLaunchArgument(
         'localization_mode',
         default_value='false',
         description='true = localization mode (existing map), false = mapping mode'
     )
 
+    use_sim_time = ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)
+
+    # Mem/IncrementalMemory: 'true' when localization_mode is false (mapping),
+    #                        'false' when localization_mode is true (localization).
+    # NOTE: Must be value_type=str because RTAB-Map parameters are std::string.
+    incremental_memory = ParameterValue(
+        PythonExpression([
+            "'false' if '", LaunchConfiguration('localization_mode'), "'.lower() in ['true', '1'] else 'true'"
+        ]),
+        value_type=str
+    )
+
+    init_wm_with_all_nodes = ParameterValue(
+        PythonExpression([
+            "'true' if '", LaunchConfiguration('localization_mode'), "'.lower() in ['true', '1'] else 'false'"
+        ]),
+        value_type=str
+    )
+
+    # In mapping mode, wipe any stale database (~/.ros/rtabmap.db) from previous sessions
+    delete_db_on_start = ParameterValue(
+        PythonExpression([
+            "'false' if '", LaunchConfiguration('localization_mode'), "'.lower() in ['true', '1'] else 'true'"
+        ]),
+        value_type=bool
+    )
+
     # ── 1. Robot State Publisher ─────────────────────────────────────
-    # Reads the URDF file and publishes static TF transforms:
-    #   base_link → oak_camera_frame → oak_imu_frame
-    # Without this node, RTAB-Map does not know where the camera is
-    # relative to the drone body.
-    urdf_file = os.path.join(pkg, 'urdf', 'drone.urdf.xacro')
-    with open(urdf_file, 'r') as f:
-        robot_description = f.read()
+    # Reads the URDF/xacro file and publishes static TF transforms:
+    #   base_link → oak_camera_frame → oak_rgb_camera_optical_frame
+    robot_description = ParameterValue(Command(['xacro ', urdf_file]), value_type=str)
 
     robot_state_publisher = Node(
         package='robot_state_publisher',
@@ -64,119 +97,83 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'robot_description': robot_description,
-            # Publish TF at 50 Hz (sufficient for drone dynamics)
             'publish_frequency': 50.0,
+            'use_sim_time': use_sim_time,
         }]
     )
 
     # ── 2. EKF — IMU + Visual Odometry Fusion ───────────────────────
-    # robot_localization implements a standard EKF (Extended Kalman Filter).
-    # It receives two sensor streams:
-    #   - /rtabmap/odom  : visually estimated pose (6DOF, 10-20 Hz)
-    #   - /oak/imu/data  : acceleration + angular velocity (200 Hz)
-    # It publishes:
-    #   - /odometry/filtered : fused state estimate (50 Hz)
     ekf_node = Node(
         package='robot_localization',
         executable='ekf_node',
         name='ekf_filter_node',
         output='screen',
         parameters=[
-            os.path.join(pkg, 'config', 'ekf_params.yaml')
+            ekf_params_file,
+            {
+                'use_sim_time': use_sim_time,
+            }
         ]
     )
 
     # ── 3. RTAB-Map Odometry (Frontend — fast) ───────────────────────
-    # RGBDOdometry is a visual odometry node using a "frame-to-map" strategy.
-    # For each new frame:
-    #   1. Detects keypoints in the current image (GFTT/Harris)
-    #   2. Matches them against keypoints from the previous frame
-    #   3. Estimates 3D motion (rotation + translation) using a PnP solver
-    #   4. Publishes the result as /rtabmap/odom
-    # Uses the IMU for orientation initialization (wait_imu_to_init)
+    # RGBDOdometry estimates 6DOF motion from stereo images.
+    # CRITICAL: publish_tf MUST be False because robot_localization (EKF)
+    # is responsible for publishing the odom -> base_link transform.
     rtabmap_odom_node = Node(
         package='rtabmap_odom',
         executable='rgbd_odometry',
         name='rgbd_odometry',
         output='screen',
-        parameters=[{
-            'frame_id':                 'base_link',
-            'odom_frame_id':            'odom',
-            'approx_sync':              True,
-            'approx_sync_max_interval': 0.02,
-            'wait_imu_to_init':         True,
-            # Frame-to-Map strategy: more robust than Frame-to-Frame
-            'Odom/Strategy':            '0',
-            # Require at least 10 common points to validate motion estimate
-            'Vis/MinInliers':           '10',
-            'Vis/InlierDistance':       '0.1',
-            # Local map of up to 1000 keypoints
-            'OdomF2M/MaxSize':          '1000',
-            # GFTT detector (Good Features to Track)
-            'Vis/FeatureType':          '6',
-            'GFTT/MinDistance':         '5',
-            'GFTT/QualityLevel':        '0.001',
-        }],
+        parameters=[
+            rtabmap_params_file,
+            {
+                'publish_tf': False,
+                'use_sim_time': use_sim_time,
+                'always_process_most_recent_frame': False,
+            }
+        ],
         remappings=[
-            # Input — topics from OAK-S2 camera
             ('rgb/image',       '/oak/rgb/image_raw'),
             ('depth/image',     '/oak/stereo/image_raw'),
             ('rgb/camera_info', '/oak/rgb/camera_info'),
             ('imu',             '/oak/imu/data'),
-            # Output — visual odometry
             ('odom',            '/rtabmap/odom'),
+            ('odom_info',       '/rtabmap/odom_info'),
         ]
     )
 
     # ── 4. RTAB-Map SLAM (Backend — global map) ──────────────────────
-    # Rtabmap is the SLAM backend. It runs at a lower frequency than
-    # odometry but maintains the global map and detects loop closures.
-    # Loop closure = recognizing a previously visited area → reduces drift.
-    # Inputs:
-    #   - RGB + Depth images from the camera
-    #   - Filtered odometry from EKF (/odometry/filtered)
-    # Outputs:
-    #   - /rtabmap/map         : 2D occupancy map (for Nav2)
-    #   - /rtabmap/cloud_map   : 3D point cloud
-    #   - /rtabmap/mapData     : full SLAM data (nodes + links)
     rtabmap_slam_node = Node(
         package='rtabmap_slam',
         executable='rtabmap',
         name='rtabmap',
         output='screen',
-        parameters=[{
-            'frame_id':              'base_link',
-            'subscribe_rgb':         True,
-            'subscribe_depth':       True,
-            'subscribe_odom_info':   True,
-            'approx_sync':           True,
-            'wait_imu_to_init':      True,
-            # Mem/IncrementalMemory controls the operating mode:
-            #   'true'  = mapping mode  (builds a new map)
-            #   'false' = localization mode (uses existing map)
-            # The value is taken from the 'localization_mode' launch argument.
-            'Mem/IncrementalMemory': LaunchConfiguration('localization_mode'),
-            # Spatial loop closure (not only visual)
-            'RGBD/ProximityBySpace': 'true',
-            # Update map only on significant motion (saves CPU)
-            'RGBD/LinearUpdate':     '0.01',
-            'RGBD/AngularUpdate':    '0.01',
-            # Max 700ms per SLAM backend iteration
-            'Rtabmap/TimeThr':       '700',
-            # 400 visual features per frame
-            'Kp/MaxFeatures':        '400',
-        }],
+        parameters=[
+            rtabmap_params_file,
+            {
+                'Mem/IncrementalMemory': incremental_memory,
+                'Mem/InitWMWithAllNodes': init_wm_with_all_nodes,
+                'use_sim_time': use_sim_time,
+                'map_always_update': True,
+                'delete_db_on_start': delete_db_on_start,
+            }
+        ],
         remappings=[
-            # Input — camera images
             ('rgb/image',       '/oak/rgb/image_raw'),
             ('depth/image',     '/oak/stereo/image_raw'),
             ('rgb/camera_info', '/oak/rgb/camera_info'),
-            # Input — filtered odometry (from EKF, not raw odometry)
             ('odom',            '/odometry/filtered'),
+            ('mapData',         '/rtabmap/mapData'),
+            ('cloud_map',       '/rtabmap/cloud_map'),
+            ('map',             '/rtabmap/grid_map'),
+            ('grid_map',        '/rtabmap/grid_map'),
+            ('mapPath',         '/rtabmap/mapPath'),
         ]
     )
 
     return LaunchDescription([
+        use_sim_time_arg,
         localization_mode_arg,
         robot_state_publisher,
         ekf_node,

@@ -32,14 +32,20 @@ How to run:
   ros2 launch drone_slam mavros.launch.py fcu_url:=/dev/ttyACM0:57600
 """
 
+import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.launch_description_sources import AnyLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    # Ensure GeographicLib finds datasets in user directory if not in /usr/share
+    geo_data_env = SetEnvironmentVariable(
+        name='GEOGRAPHICLIB_DATA',
+        value=os.path.expanduser('~/.local/share/GeographicLib')
+    )
 
     # ── Configurable arguments ───────────────────────────────────────
     fcu_url_arg = DeclareLaunchArgument(
@@ -59,14 +65,13 @@ def generate_launch_description():
     )
 
     # ── Launch MAVROS with the PX4 configuration ────────────────────
-    # MAVROS ships with predefined configuration files for PX4.
-    # px4.launch.py already knows which MAVLink plugins to activate for PX4.
+    # MAVROS in ROS 2 Jazzy ships px4.launch (XML).
     mavros_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
+        AnyLaunchDescriptionSource([
             PathJoinSubstitution([
                 FindPackageShare('mavros'),
                 'launch',
-                'px4.launch.py'
+                'px4.launch'
             ])
         ]),
         launch_arguments={
@@ -78,6 +83,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        geo_data_env,
         fcu_url_arg,
         gcs_url_arg,
         mavros_launch,

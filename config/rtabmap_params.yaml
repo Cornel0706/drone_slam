@@ -14,7 +14,7 @@
 # ============================================================
 
 # ── Visual Odometry Node (RGBDOdometry) ───────────────────────
-rgbd_odometry_node:
+rgbd_odometry:
   ros__parameters:
     # The robot's body frame (drone center of mass)
     frame_id: "base_link"
@@ -22,11 +22,17 @@ rgbd_odometry_node:
     # The odometry frame (fixed at startup position)
     odom_frame_id: "odom"
 
+    # IMPORTANT: False because robot_localization (EKF) publishes odom -> base_link!
+    publish_tf: false
+
+    # Prevent aggressive frame drops during simulation timing jitter
+    always_process_most_recent_frame: false
+
     # Approximate topic synchronization (camera topics are not perfectly synced)
     approx_sync: true
 
-    # Maximum sync interval (seconds) — 20ms for 20fps camera
-    approx_sync_max_interval: 0.02
+    # Maximum sync interval (seconds)
+    approx_sync_max_interval: 0.05
 
     # Wait for IMU before initializing orientation (important for drones)
     wait_imu_to_init: true
@@ -39,32 +45,50 @@ rgbd_odometry_node:
     # Visual feature detection (keypoints)
     # GFTT = Good Features to Track (Harris + Shi-Tomasi corners)
     Vis/FeatureType: "6"        # GFTT detector
-    GFTT/MinDistance: "5"       # minimum distance between keypoints (pixels)
-    GFTT/QualityLevel: "0.001"  # keypoint quality threshold
+    Vis/MaxFeatures: "800"      # extract up to 800 features per frame
+    GFTT/MinDistance: "3"       # minimum distance between keypoints (pixels)
+    GFTT/QualityLevel: "0.0005" # keypoint quality threshold
+    Vis/MinInliers: "10"        # minimum inliers for valid transformation (10 ensures high confidence)
+    Vis/InlierDistance: "0.15"  # maximum allowed inlier reprojection distance (meters)
 
-    # Minimum number of matched points for a valid motion estimate
-    Vis/MinInliers: "10"
-
-    # Maximum allowed inlier reprojection distance (in meters)
-    Vis/InlierDistance: "0.1"
+    # Outlier rejection: reject physically impossible velocity spikes
+    Odom/MaxTranslation: "0.5"  # max 0.5m translation per frame (discards velocity explosion)
+    Odom/MaxRotation: "0.5"     # max 0.5 rad (~28 deg) rotation per frame
 
     # Maximum size of the local keyframe map (Frame-to-Map)
-    OdomF2M/MaxSize: "1000"
+    OdomF2M/MaxSize: "2000"
+    Odom/KeyframeThr: "0.3"     # create keyframes frequently on motion
+
+    # Do not auto reset odometry on temporary feature drop
+    Odom/ResetCountdown: "0"
 
 # ── Full SLAM Node (Rtabmap backend) ──────────────────────────
-rtabmap_node:
+rtabmap:
   ros__parameters:
     frame_id: "base_link"
+    map_always_update: true
 
     # Subscribe to RGB + Depth separately (not as a combined RGBD stream)
     subscribe_rgb: true
     subscribe_depth: true
 
-    # Also receive odometry covariance info from the odometry node
-    subscribe_odom_info: true
+    # Odometry is fused by robot_localization (EKF) which does not publish OdomInfo
+    subscribe_odom_info: false
 
-    # Approximate synchronization between topics
+    # Synchronization
     approx_sync: true
+    approx_sync_max_interval: 0.1
+    queue_size: 30
+
+    # 2D Occupancy Grid and 3D Point Cloud generation from Depth Camera
+    Grid/Sensor: "1"            # 1 = generate 2D occupancy grid from Depth Camera
+    Grid/3D: "true"             # enable 3D point cloud generation (/rtabmap/cloud_map)
+    Grid/RayTracing: "true"     # ray trace unknown and free space
+    Grid/RangeMax: "10.0"       # max sensor range in meters
+    Grid/CellSize: "0.05"       # 5cm grid resolution
+    Grid/MaxObstacleHeight: "5.0"
+    Grid/MaxGroundHeight: "0.15"
+    Rtabmap/DetectionRate: "2.0"
 
     # Incremental memory: continuously adds new locations to memory (mapping mode)
     # Set to "false" for localization-only mode (no new nodes added)
@@ -73,17 +97,41 @@ rtabmap_node:
     # Do not pre-populate working memory with all nodes at startup (fresh start)
     Mem/InitWMWithAllNodes: "false"
 
-    # Spatial loop closure in addition to visual loop closure
-    RGBD/ProximityBySpace: "true"
+    # ── Loop Closure & Graph Optimization Stabilization ───────
+    # In an indoor room with repetitive wall textures, false visual loop closures
+    # can trigger huge graph optimization errors (e.g. abs error 750m+).
+    # These settings prevent false loop closures and stabilize the pose graph:
 
-    # Update the map only on significant motion (saves CPU on drone)
-    # Linear: at least 1cm of movement before updating
-    RGBD/LinearUpdate: "0.01"
-    # Angular: at least ~0.57 degrees of rotation before updating
-    RGBD/AngularUpdate: "0.01"
+    # Higher loop closure threshold (0.11 default is too sensitive/aggressive)
+    Rtabmap/LoopThr: "0.25"
+
+    # Disable spatial proximity loop closures on the spot
+    # During rotation at (0,0), all frames are at the same spatial position.
+    # Enabling proximity by space causes all 16 directions to match each other!
+    RGBD/ProximityBySpace: "false"
+
+    # Geometric distance limit: reject loop closures if distance > 5m
+    RGBD/MaxLoopClosureDistance: "5.0"
+
+    # Reject loop closures if optimization error ratio is high
+    RGBD/OptimizeMaxError: "3.0"
+
+    # Optimize graph from newest node (current drone pose) instead of oldest
+    # This prevents the current drone position from jumping when a loop closure is accepted
+    RGBD/OptimizeFromGraphEnd: "true"
+
+    # Robust graph optimization (Vertigo) to downweight outlier constraints
+    Optimizer/Robust: "true"
+
+    # Require at least 20 inlier correspondences for loop closure transformations
+    Vis/MinInliers: "20"
+
+    # Update map on reasonable displacement: 10cm linear or ~5.7° angular
+    # (Prevents flooding the graph with 600+ overlapping nodes at the exact same spot)
+    RGBD/LinearUpdate: "0.10"
+    RGBD/AngularUpdate: "0.10"
 
     # Maximum time budget per SLAM backend iteration (milliseconds)
-    # 700ms = ~1.4 Hz for backend (acceptable — odometry runs much faster)
     Rtabmap/TimeThr: "700"
 
     # Maximum number of visual features per image (CPU vs. accuracy trade-off)

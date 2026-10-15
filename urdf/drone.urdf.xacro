@@ -96,4 +96,36 @@
 
   <link name="oak_imu_frame"/>
 
+  <!-- ============================================================
+    CAMERA OPTICAL FRAMES (REP-103)
+    ROS standard for optical frame:
+      z = forward (along optical axis)
+      x = right
+      y = down
+  ============================================================ -->
+  <joint name="oak_to_rgb_frame" type="fixed">
+    <parent link="oak_camera_frame"/>
+    <child link="oak_rgb_camera_frame"/>
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+  </joint>
+
+  <link name="oak_rgb_camera_frame"/>
+
+  <joint name="oak_rgb_to_optical_frame" type="fixed">
+    <parent link="oak_rgb_camera_frame"/>
+    <child link="oak_rgb_camera_optical_frame"/>
+    <origin xyz="0.0 0.0 0.0" rpy="-1.57079632679 0.0 -1.57079632679"/>
+  </joint>
+
+  <link name="oak_rgb_camera_optical_frame"/>
+
+  <!-- Alias link for camera root 'oak' used by depthai-ros -->
+  <joint name="oak_camera_to_oak_alias" type="fixed">
+    <parent link="oak_camera_frame"/>
+    <child link="oak"/>
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+  </joint>
+
+  <link name="oak"/>
+
 </robot>

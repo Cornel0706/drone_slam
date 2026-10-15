@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# RTAB-Map databases
+*.db
+
+# Build & editors
+*.swp
+*~
+.DS_Store
