@@ -282,8 +282,8 @@ class AutoMapper(Node):
         if self.odom_lost:
             return False
 
-        # Inlier threshold (< 10 is degraded in flight)
-        if self.odom_inliers < 10:
+        # Inlier threshold (< 8 is degraded in flight)
+        if self.odom_inliers < 8:
             return False
 
         # Coordinates corrupted by NaN or Inf
@@ -352,8 +352,12 @@ class AutoMapper(Node):
         # 1. Check if already airborne
         alt = self.current_pose.pose.position.z
         if alt >= 1.0 and self.current_state.armed:
-            self.get_logger().info(f'Vehicle already airborne at {alt:.2f}m. Proceeding directly.')
-            self.target_altitude = float(target_alt)
+            self.target_altitude = float(alt)
+            self.cmd_raw.position.z = float(self.target_altitude)
+            self.get_logger().info(
+                f'Vehicle already airborne at {alt:.2f}m. '
+                f'Dynamically adopting target_altitude = {self.target_altitude:.2f}m.'
+            )
             return True
 
         self.get_logger().info(f'Initiating automatic takeoff to {target_alt:.1f}m...')
@@ -422,38 +426,55 @@ class AutoMapper(Node):
                 break
             self.sleep_and_stream(0.2)
 
-        # Level off into pure hover
-        self.publish_zero_setpoint(target_z=self.target_altitude)
+        # Settle and dynamically adopt the actual reached takeoff altitude
         self.sleep_and_stream(1.5)
-
-        alt = self.current_pose.pose.position.z
-        if alt < 0.8:
+        current_alt = self.current_pose.pose.position.z
+        if current_alt >= 0.8:
+            self.target_altitude = float(current_alt)
+            self.cmd_raw.position.z = float(self.target_altitude)
+            self.get_logger().info(f'Takeoff settled. Dynamically set target_altitude = {self.target_altitude:.2f}m')
+        else:
             self.get_logger().warn(
-                f'Takeoff altitude low ({alt:.2f}m). '
+                f'Takeoff altitude low ({current_alt:.2f}m). '
                 'Tip: you can enter "commander takeoff" in Terminal 1 if FCU requires manual authorization.'
             )
             return False
 
+        self.publish_zero_setpoint(target_z=self.target_altitude)
+        self.sleep_and_stream(1.0)
         return True
 
     def switch_to_offboard(self, pre_stream_sec=2.0, max_wait_sec=8.0) -> bool:
         """
         Transitions cleanly and securely to OFFBOARD mode:
-        1. Pre-streams hybrid setpoints (vx=0.0, vy=0.0, pz=1.5m, yaw_rate=0.0)
+        1. Reads and adopts actual current altitude if airborne.
+        2. Pre-streams hybrid setpoints (vx=0.0, vy=0.0, pz=target_altitude, yaw_rate=0.0)
            for 2.0s at 50 Hz to prime PX4's offboard signal monitor.
-        2. Sends SetMode('OFFBOARD') request while continuously maintaining the 50 Hz stream.
-        3. Verifies actual switch to OFFBOARD in self.current_state.mode, retrying if needed.
-        4. Holds hover for 2.0s to allow PX4's altitude hold controller to fully engage.
+        3. Sends SetMode('OFFBOARD') request while continuously maintaining the 50 Hz stream.
+        4. Verifies actual switch to OFFBOARD in self.current_state.mode, retrying if needed.
+        5. Dynamically captures the exact altitude at the moment of OFFBOARD confirmation
+           and sets it as the permanent target_altitude.
+        6. Holds hover for 2.0s to allow PX4's altitude hold controller to fully engage.
         """
+        # Step 0: Ensure target_altitude matches the actual altitude right now before pre-streaming
+        actual_z = self.current_pose.pose.position.z
+        if actual_z >= 0.8:
+            self.target_altitude = float(actual_z)
+            self.cmd_raw.position.z = float(self.target_altitude)
+
         self.get_logger().info(
             f'>>> Step 1/3: Pre-streaming hybrid setpoints for {pre_stream_sec:.1f}s '
-            f'(vx=0, vy=0, locked z={self.target_altitude:.1f}m)...'
+            f'(vx=0, vy=0, locked z={self.target_altitude:.2f}m)...'
         )
         self.publish_zero_setpoint(target_z=self.target_altitude)
         self.sleep_and_stream(pre_stream_sec)
 
         if self.current_state.mode == 'OFFBOARD':
-            self.get_logger().info('Vehicle already in OFFBOARD mode.')
+            actual_alt = self.current_pose.pose.position.z
+            if actual_alt >= 0.8:
+                self.target_altitude = float(actual_alt)
+                self.cmd_raw.position.z = float(self.target_altitude)
+            self.get_logger().info(f'Vehicle already in OFFBOARD mode at altitude {self.target_altitude:.2f}m.')
             return True
 
         self.get_logger().info('>>> Step 2/3: Sending OFFBOARD mode switch request while maintaining 50Hz stream...')
@@ -472,10 +493,16 @@ class AutoMapper(Node):
             time.sleep(0.02)
 
             if self.current_state.mode == 'OFFBOARD':
+                # Dynamically capture and lock the exact altitude at the moment of OFFBOARD confirmation!
+                confirmed_alt = self.current_pose.pose.position.z
+                if confirmed_alt >= 0.8:
+                    self.target_altitude = float(confirmed_alt)
+                    self.cmd_raw.position.z = float(self.target_altitude)
                 self.get_logger().info(
-                    f'>>> OFFBOARD Mode Confirmed! Current Altitude: {self.current_pose.pose.position.z:.2f}m '
-                    f'(Locked target: {self.target_altitude:.1f}m)'
+                    f'>>> OFFBOARD Mode Confirmed! Captured Current Altitude: {self.current_pose.pose.position.z:.2f}m '
+                    f'as permanent locked target_altitude!'
                 )
+                self.publish_zero_setpoint(target_z=self.target_altitude)
                 break
 
             # Retry request every 1.0s if mode hasn't switched yet
@@ -489,9 +516,9 @@ class AutoMapper(Node):
             self.get_logger().error(f'Failed to switch to OFFBOARD mode! Current mode: {self.current_state.mode}')
             return False
 
-        # Settle in OFFBOARD hover to let PX4 altitude hold engage cleanly
+        # Settle in OFFBOARD hover to let PX4 altitude hold engage cleanly at the captured altitude
         self.get_logger().info(
-            f'>>> Step 3/3: Holding stable OFFBOARD hover for 2.0s at locked z={self.target_altitude:.1f}m...'
+            f'>>> Step 3/3: Holding stable OFFBOARD hover for 2.0s at locked z={self.target_altitude:.2f}m...'
         )
         self.publish_zero_setpoint(target_z=self.target_altitude)
         self.sleep_and_stream(2.0)
@@ -536,7 +563,7 @@ class AutoMapper(Node):
             return
 
         # Settle in hover to acquire initial visual features
-        self.get_logger().info(f'Holding initial hover at {self.target_altitude:.1f}m to lock visual odometry...')
+        self.get_logger().info(f'Holding initial hover at {self.target_altitude:.2f}m to lock visual odometry...')
         self.publish_zero_setpoint(target_z=self.target_altitude)
         self.sleep_and_stream(2.0)
         if self.odom_received:
@@ -544,7 +571,7 @@ class AutoMapper(Node):
 
         # 4. Phase 1: Discretized 360° Panoramic Scan (Step-and-Pause)
         # 16 steps of ~22.5°: rotate gently at 0.22 rad/s for 1.78s, then pause 0.8s
-        # Altitude is rigidly held at 1.5m by PX4's position PID!
+        # Altitude is rigidly held at self.target_altitude by PX4's position PID!
         total_steps = 16
         step_angle_deg = 360.0 / total_steps
         yaw_speed = 0.22       # rad/s (~12.6 deg/s) - smooth and gentle
@@ -552,7 +579,7 @@ class AutoMapper(Node):
         pause_duration = 0.8   # seconds of zero motion to allow SLAM keyframe registration
 
         self.get_logger().info(
-            f'>>> PHASE 1: Discretized 360° Panoramic Scan ({total_steps} steps of {step_angle_deg:.1f}° at locked z={self.target_altitude:.1f}m)...'
+            f'>>> PHASE 1: Discretized 360° Panoramic Scan ({total_steps} steps of {step_angle_deg:.1f}° at locked z={self.target_altitude:.2f}m)...'
         )
 
         for step in range(1, total_steps + 1):
@@ -566,23 +593,24 @@ class AutoMapper(Node):
             self.publish_zero_setpoint(target_z=self.target_altitude)
             self.sleep_and_stream(pause_duration)
 
-        self.get_logger().info(f'>>> 360° Panoramic Scan Complete! Settle hover at {self.target_altitude:.1f}m for 2s...')
+        self.get_logger().info(f'>>> 360° Panoramic Scan Complete! Settle hover at {self.target_altitude:.2f}m for 2s...')
         self.publish_zero_setpoint(target_z=self.target_altitude)
         self.sleep_and_stream(2.0)
 
         # 5. Phase 2: Ultra-Smooth Survey Flight in Body Coordinates
-        # Speeds set to 0.30 m/s for clean, visible physical motion in Gazebo
+        # Speeds reduced to 0.18 m/s for safe, blur-free visual feature tracking in RTAB-Map
         # v_forward and v_strafe_left automatically transform to world ENU based on current yaw
-        # Altitude is held rigidly at 1.5m!
+        # Altitude is held rigidly at self.target_altitude!
+        survey_speed = 0.18  # m/s (safe speed to eliminate motion blur and feature loss)
         legs = [
-            ("Forward towards North Wall",       0.30,  0.0,  0.0, 4.0),
-            ("Strafe Right towards East Wall",   0.0, -0.30,  0.0, 4.0),
-            ("Backward towards South Wall",     -0.30,  0.0,  0.0, 4.0),
-            ("Strafe Left towards Center",       0.0,  0.30,  0.0, 4.0),
+            ("Forward towards North Wall",       survey_speed,          0.0,  0.0, 4.0),
+            ("Strafe Right towards East Wall",            0.0, -survey_speed,  0.0, 4.0),
+            ("Backward towards South Wall",     -survey_speed,          0.0,  0.0, 4.0),
+            ("Strafe Left towards Center",                0.0,  survey_speed,  0.0, 4.0),
         ]
 
         self.get_logger().info(
-            f'>>> PHASE 2: Survey Flight (body-frame translation @ 0.30 m/s, locked z={self.target_altitude:.1f}m)...'
+            f'>>> PHASE 2: Survey Flight (body-frame translation @ {survey_speed:.2f} m/s, locked z={self.target_altitude:.2f}m)...'
         )
         for desc, v_fwd, v_lat, vz, duration in legs:
             # Segment 1
@@ -607,7 +635,7 @@ class AutoMapper(Node):
         self.publish_zero_setpoint(target_z=self.target_altitude)
         self.get_logger().info(
             f'>>> Autonomous Mapping Mission Complete! 3D Map and 2D Grid are populated. '
-            f'Drone holding stable hover at center (locked z={self.target_altitude:.1f}m).'
+            f'Drone holding stable hover at center (locked z={self.target_altitude:.2f}m).'
         )
         while rclpy.ok():
             self.sleep_and_stream(0.5)
