@@ -2,29 +2,30 @@
 """
 Node: auto_mapper.py (drone_sim)
 =================================
-Autonomous SLAM Mapping Routine with Visual Odometry Feedback & Robust OFFBOARD Handover:
-  1. Robust, Armored Takeoff:
-     - Handles AUTO.TAKEOFF, CommandTOL, and Offboard climb fallback.
-     - Detects manual takeoff instantly if user executed "commander takeoff".
-  2. Safe & Seamless OFFBOARD Transition:
-     - Streams continuous zero-velocity setpoints (vx=0.0, vy=0.0, vz=0.0, wz=0.0)
-       for 2.5 seconds BEFORE requesting OFFBOARD mode to prime PX4's signal buffer.
-     - Maintains uninterrupted 50 Hz setpoint stream during mode switch request.
-     - Actively verifies FCU mode confirmation and retries safely if needed.
-     - Stabilizes for 2.0 seconds in zero-velocity hover so PX4's Altitude Hold
-       controller cleanly locks onto current altitude without thrust cut or drop.
-  3. Phase 1: Discretized 360° Panoramic Scan (Step-and-Pause):
-     - 16 gentle incremental rotation steps (~22.5° each at 0.18 rad/s).
-     - 0.8s stationary pause between steps for blur-free feature extraction.
-  4. Phase 2: Ultra-smooth Survey Displacements:
-     - Gentle translation at 0.12 m/s (zero tilt, clean depth maps).
-     - Vertical velocity vz is strictly 0.0 so PX4 holds altitude locked.
-  5. Real-time Closed-Loop Odometry Feedback:
-     - Subscribes to /rtabmap/odom_info and /rtabmap/odom.
-     - Monitors tracking status (lost flag, inliers count, NaNs).
-     - If tracking degrades (inliers < 12 or lost), IMMEDIATELY halts motion into hover.
-     - Waits for visual tracking to recover before resuming trajectory.
-  6. Returns to center and hovers stably.
+Autonomous SLAM Mapping Routine with Ground-Decoupled Takeoff, Dual Setpoint Streaming & Body-Frame Control:
+  1. Armored Autonomous Takeoff:
+     - Sends MAV_CMD_NAV_TAKEOFF (CommandLong 22) + CommandTOL with NaNs for local in-place ascent.
+     - Automatically arms and commands AUTO.TAKEOFF without requiring terminal intervention.
+     - Retains instant fallback detection if user manually executes "commander takeoff".
+  2. Ground-Decoupled Odometry Feedback:
+     - Visual odometry health check is strictly BYPASSED on the ground (alt < 1.0m),
+       preventing stereo disparity blind zones (<30cm from floor) from paralyzing liftoff.
+     - Once airborne (alt >= 1.0m), active tracking feedback protects against motion blur.
+  3. Dual-Stream Setpoint Velocity & Body-to-ENU Transformation:
+     - Publishes simultaneously to /mavros/setpoint_velocity/cmd_vel (TwistStamped with sim clock)
+       and /mavros/setpoint_velocity/cmd_vel_unstamped (Twist) to eliminate topic/format mismatches.
+     - Automatically rotates body-relative commands (Forward/Lateral) into world ENU coordinates
+       using current drone yaw, ensuring commands physically move the drone in the intended direction.
+  4. Smooth OFFBOARD Handover:
+     - Streams zero-velocity setpoints for 2.0s at 50 Hz before mode switch to prime PX4 watchdog.
+     - Verifies OFFBOARD confirmation and stabilizes hover for 2.0s.
+  5. Phase 1: Discretized 360° Panoramic Scan (Step-and-Pause):
+     - 16 gentle incremental rotation steps (~22.5° each at 0.22 rad/s).
+     - 0.8s stationary pause between steps for keyframe matching.
+  6. Phase 2: Survey Displacements in Body Frame (0.30 m/s):
+     - Visibly moves the drone across the room to map walls and obstacles.
+     - vz is held strictly 0.0 to lock altitude.
+  7. Returns to center and holds position in stable hover.
 """
 
 import math
@@ -32,10 +33,10 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from geometry_msgs.msg import Twist, PoseStamped
+from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
 from nav_msgs.msg import Odometry
 from rtabmap_msgs.msg import OdomInfo
-from mavros_msgs.srv import CommandBool, CommandTOL, SetMode, ParamSet
+from mavros_msgs.srv import CommandBool, CommandTOL, CommandLong, SetMode, ParamSet
 from mavros_msgs.msg import State
 
 
@@ -50,9 +51,16 @@ class AutoMapper(Node):
             self.declare_parameter('use_sim_time', True)
 
         # ── Publishers ─────────────────────────────────────────────
+        # 1. Unstamped Twist (standard MAVROS topic)
         self.vel_pub = self.create_publisher(
             Twist,
             '/mavros/setpoint_velocity/cmd_vel_unstamped',
+            10
+        )
+        # 2. Stamped Twist (canonical topic with explicit simulation timestamp)
+        self.vel_stamped_pub = self.create_publisher(
+            TwistStamped,
+            '/mavros/setpoint_velocity/cmd_vel',
             10
         )
 
@@ -95,6 +103,7 @@ class AutoMapper(Node):
         # ── Service Clients ────────────────────────────────────────
         self.arming_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
+        self.cmd_long_client = self.create_client(CommandLong, '/mavros/cmd/command')
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.param_set_client = self.create_client(ParamSet, '/mavros/param/set')
 
@@ -146,11 +155,29 @@ class AutoMapper(Node):
         else:
             self.odom_has_nan = False
 
+    def get_current_yaw(self) -> float:
+        """Extracts current yaw angle (radians) from FCU pose orientation quaternion."""
+        q = self.current_pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        if not (math.isfinite(siny_cosp) and math.isfinite(cosy_cosp)):
+            return 0.0
+        return math.atan2(siny_cosp, cosy_cosp)
+
     def timer_cb(self):
+        """Dispatches velocity commands to both stamped and unstamped MAVROS topics."""
+        # 1. Unstamped
         self.vel_pub.publish(self.cmd_twist)
+        
+        # 2. Stamped with current Gazebo simulation timestamp
+        stamped = TwistStamped()
+        stamped.header.stamp = self.get_clock().now().to_msg()
+        stamped.header.frame_id = 'base_link'
+        stamped.twist = self.cmd_twist
+        self.vel_stamped_pub.publish(stamped)
 
     def set_vel(self, vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0):
-        """Sets linear and angular velocity commands with explicit float precision."""
+        """Sets linear and angular velocity commands in local ENU frame."""
         self.cmd_twist.linear.x = float(vx)
         self.cmd_twist.linear.y = float(vy)
         self.cmd_twist.linear.z = float(vz)
@@ -158,13 +185,33 @@ class AutoMapper(Node):
         self.cmd_twist.angular.y = 0.0
         self.cmd_twist.angular.z = float(yaw_rate)
 
+    def set_body_vel(self, v_forward=0.0, v_strafe_left=0.0, vz=0.0, yaw_rate=0.0):
+        """
+        Converts Body-frame speeds (Forward, Strafe Left, Up, Yaw rate)
+        into Local ENU velocities using the drone's actual current yaw heading.
+        This guarantees that commanding +Forward physically moves in the direction the camera faces.
+        """
+        yaw = self.get_current_yaw()
+        vx_enu = float(v_forward) * math.cos(yaw) - float(v_strafe_left) * math.sin(yaw)
+        vy_enu = float(v_forward) * math.sin(yaw) + float(v_strafe_left) * math.cos(yaw)
+        self.set_vel(vx_enu, vy_enu, vz, yaw_rate)
+
     def publish_zero_setpoint(self):
         """Ensures all axes are strictly 0.0 and immediately dispatches to FCU."""
         self.set_vel(0.0, 0.0, 0.0, 0.0)
-        self.vel_pub.publish(self.cmd_twist)
+        self.timer_cb()
 
     def is_odometry_healthy(self) -> bool:
-        """Checks visual odometry tracking quality."""
+        """
+        Checks visual odometry tracking quality.
+        CRITICAL: Bypassed when on ground (alt < 1.0m) to avoid blocking liftoff!
+        """
+        alt = self.current_pose.pose.position.z
+        if alt < 1.0:
+            # On the ground or during initial climb, camera is too close to floor (<30cm)
+            # for stereo disparity. DO NOT block motion!
+            return True
+
         if not self.odom_received:
             return True
 
@@ -176,8 +223,8 @@ class AutoMapper(Node):
         if self.odom_lost:
             return False
 
-        # Inlier threshold (< 12 is degraded)
-        if self.odom_inliers < 12:
+        # Inlier threshold (< 10 is degraded in flight)
+        if self.odom_inliers < 10:
             return False
 
         # Coordinates corrupted by NaN or Inf
@@ -190,15 +237,14 @@ class AutoMapper(Node):
         """Streams current setpoints at 50Hz without blocking the ROS executor."""
         end_time = time.time() + duration_sec
         while rclpy.ok() and time.time() < end_time:
-            self.vel_pub.publish(self.cmd_twist)
+            self.timer_cb()
             rclpy.spin_once(self, timeout_sec=0.02)
             time.sleep(0.02)
 
-    def safe_motion(self, vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0, duration_sec=1.0, desc=""):
+    def safe_motion(self, v_forward=0.0, v_strafe_left=0.0, vz=0.0, yaw_rate=0.0, duration_sec=1.0, desc=""):
         """
-        Executes a motion step with active visual odometry health monitoring.
-        vz is maintained strictly as requested (0.0 for horizontal motion),
-        allowing PX4's internal altitude hold to keep height rigidly fixed.
+        Executes a motion step in drone body frame with active odometry health feedback.
+        vz is maintained strictly as requested (0.0 for horizontal motion) to lock altitude.
         """
         if desc:
             self.get_logger().info(f'-> Motion: {desc} (dur: {duration_sec:.1f}s)')
@@ -207,13 +253,12 @@ class AutoMapper(Node):
         dt = 0.02
 
         while rclpy.ok() and time_moved < duration_sec:
-            # Feedback quality check:
+            # Feedback quality check (active only when airborne):
             if not self.is_odometry_healthy():
                 self.get_logger().warn(
                     f'[ODOM FEEDBACK] Tracking degraded (lost={self.odom_lost}, inliers={self.odom_inliers})! '
                     'Halting into hover until camera settles...'
                 )
-                # Command instant hover (vz=0.0 holds altitude)
                 self.publish_zero_setpoint()
 
                 # Hold hover until odometry stays healthy continuously for 1.0s
@@ -229,8 +274,8 @@ class AutoMapper(Node):
                     f'[ODOM FEEDBACK] Tracking recovered (inliers={self.odom_inliers})! Resuming motion.'
                 )
 
-            # Set requested velocity — no artificial Z offsets that cause runaway climbing
-            self.set_vel(vx, vy, vz, yaw_rate)
+            # Set requested body velocity converted to world ENU
+            self.set_body_vel(v_forward, v_strafe_left, vz, yaw_rate)
             self.sleep_and_stream(dt)
             time_moved += dt
 
@@ -239,10 +284,11 @@ class AutoMapper(Node):
 
     def perform_takeoff(self, target_alt=2.0) -> bool:
         """
-        Armored takeoff routine:
-        - If already flying (e.g. manual commander takeoff), detects it and proceeds immediately.
-        - Sets AUTO.TAKEOFF, sends CommandTOL and Arming command simultaneously.
-        - Waits until target altitude is reached, then levels off cleanly.
+        Armored autonomous takeoff routine:
+        - If already airborne (e.g. manual commander takeoff), detects it and proceeds immediately.
+        - Sends MAV_CMD_NAV_TAKEOFF (CommandLong command 22) with NaNs for in-place vertical liftoff.
+        - Commands CommandTOL with NaNs and requests AUTO.TAKEOFF flight mode.
+        - Arms the vehicle and monitors climb until target hover altitude (>=1.5m) is reached.
         """
         # 1. Check if already airborne
         alt = self.current_pose.pose.position.z
@@ -252,63 +298,63 @@ class AutoMapper(Node):
 
         self.get_logger().info(f'Initiating automatic takeoff to {target_alt:.1f}m...')
 
-        # Ensure setpoint stream is active (required for MAVROS/PX4 offboard)
+        # Ensure setpoint stream is active (required for MAVROS/PX4 offboard watchdog)
         self.publish_zero_setpoint()
-        self.sleep_and_stream(0.5)
+        self.sleep_and_stream(1.0)
 
-        # 2. Stage 1: Try AUTO.TAKEOFF (up to 5 attempts)
+        # 2. Multi-stage takeoff commands:
         for attempt in range(1, 6):
             alt = self.current_pose.pose.position.z
             if alt >= 1.2:
                 self.get_logger().info(f'Takeoff detected! Alt: {alt:.2f}m')
                 break
 
-            self.get_logger().info(f'Takeoff attempt {attempt}/5 (AUTO.TAKEOFF)...')
+            self.get_logger().info(f'Takeoff attempt {attempt}/5...')
 
-            # Request AUTO.TAKEOFF flight mode
+            # A. Send MAV_CMD_NAV_TAKEOFF via CommandLong (exact equivalent of PX4 "commander takeoff")
+            if self.cmd_long_client.service_is_ready():
+                cl_req = CommandLong.Request()
+                cl_req.broadcast = False
+                cl_req.command = 22  # MAV_CMD_NAV_TAKEOFF
+                cl_req.confirmation = 0
+                cl_req.param1 = 0.0          # pitch
+                cl_req.param4 = float('nan') # yaw
+                cl_req.param5 = float('nan') # lat (NaN = takeoff from current position)
+                cl_req.param6 = float('nan') # lon (NaN = takeoff from current position)
+                cl_req.param7 = float('nan') # alt (NaN = use MIS_TAKEOFF_ALT)
+                self.cmd_long_client.call_async(cl_req)
+
+            # B. Send CommandTOL with NaNs for local in-place takeoff
+            if self.takeoff_client.service_is_ready():
+                t_req = CommandTOL.Request()
+                t_req.min_pitch = 0.0
+                t_req.yaw = float('nan')
+                t_req.latitude = float('nan')
+                t_req.longitude = float('nan')
+                t_req.altitude = float(target_alt)
+                self.takeoff_client.call_async(t_req)
+
+            # C. Request AUTO.TAKEOFF mode
             if self.mode_client.service_is_ready():
                 m_req = SetMode.Request()
                 m_req.custom_mode = 'AUTO.TAKEOFF'
                 self.mode_client.call_async(m_req)
 
-            # Request Takeoff to target altitude
-            if self.takeoff_client.service_is_ready():
-                t_req = CommandTOL.Request()
-                t_req.altitude = float(target_alt)
-                self.takeoff_client.call_async(t_req)
-
-            # Request Arming
-            if not self.current_state.armed:
-                if self.arming_client.service_is_ready():
-                    a_req = CommandBool.Request()
-                    a_req.value = True
-                    self.arming_client.call_async(a_req)
-
-            self.sleep_and_stream(1.0)
-
-        # 3. Stage 2: If still on ground, try Offboard climb fallback
-        if self.current_pose.pose.position.z < 0.5:
-            self.get_logger().info('Switching to OFFBOARD climb takeoff fallback...')
-            self.set_vel(0.0, 0.0, 0.6, 0.0)
-            self.sleep_and_stream(1.5)
-
-            if self.mode_client.service_is_ready():
-                m_req = SetMode.Request()
-                m_req.custom_mode = 'OFFBOARD'
-                self.mode_client.call_async(m_req)
-
+            # D. Request Arming
             if not self.current_state.armed and self.arming_client.service_is_ready():
                 a_req = CommandBool.Request()
                 a_req.value = True
                 self.arming_client.call_async(a_req)
 
-        # 4. Wait for vehicle to reach target hover altitude
+            self.sleep_and_stream(1.0)
+
+        # 3. Wait for vehicle to climb to target hover altitude
         t_start = time.time()
         step = 0
         while rclpy.ok() and (time.time() - t_start < 15.0):
             alt = self.current_pose.pose.position.z
             step += 1
-            if step % 10 == 0:
+            if step % 5 == 0:
                 self.get_logger().info(f'Climbing... Alt: {alt:.2f}m / Target: {target_alt:.1f}m')
             if alt >= 1.5:
                 self.get_logger().info(f'Target altitude reached ({alt:.2f}m)!')
@@ -319,24 +365,25 @@ class AutoMapper(Node):
         self.publish_zero_setpoint()
         self.sleep_and_stream(1.5)
 
-        if self.current_pose.pose.position.z < 0.8:
+        alt = self.current_pose.pose.position.z
+        if alt < 0.8:
             self.get_logger().warn(
-                f'Takeoff altitude low ({self.current_pose.pose.position.z:.2f}m). '
-                'Tip: you can enter "commander takeoff" in Terminal 1 at any time.'
+                f'Takeoff altitude low ({alt:.2f}m). '
+                'Tip: you can enter "commander takeoff" in Terminal 1 if FCU requires manual authorization.'
             )
             return False
 
         return True
 
-    def switch_to_offboard(self, pre_stream_sec=2.5, max_wait_sec=8.0) -> bool:
+    def switch_to_offboard(self, pre_stream_sec=2.0, max_wait_sec=8.0) -> bool:
         """
         Transitions cleanly and securely to OFFBOARD mode:
         1. Explicitly sets zero velocity setpoint (vx=0.0, vy=0.0, vz=0.0, wz=0.0).
-        2. Pre-streams zero velocity setpoints continuously for 2.5s at 50 Hz
+        2. Pre-streams zero velocity setpoints continuously for 2.0s at 50 Hz
            to thoroughly prime PX4's offboard signal monitor.
         3. Sends SetMode('OFFBOARD') request while continuously maintaining the 50 Hz stream.
         4. Verifies actual switch to OFFBOARD in self.current_state.mode, retrying if needed.
-        5. Holds zero-velocity hover for another 2.0s to allow PX4's altitude hold / position
+        5. Holds zero-velocity hover for another 2.0s to allow PX4's altitude hold
            controller to fully engage without any thrust cuts or altitude drop.
         """
         self.get_logger().info(
@@ -361,7 +408,6 @@ class AutoMapper(Node):
         last_req_time = time.time()
 
         while rclpy.ok() and (time.time() - t_start < max_wait_sec):
-            # Maintain uninterrupted 50Hz zero setpoint stream
             self.publish_zero_setpoint()
             rclpy.spin_once(self, timeout_sec=0.02)
             time.sleep(0.02)
@@ -404,6 +450,7 @@ class AutoMapper(Node):
         self.mode_client.wait_for_service(timeout_sec=3.0)
         self.arming_client.wait_for_service(timeout_sec=3.0)
         self.takeoff_client.wait_for_service(timeout_sec=3.0)
+        self.cmd_long_client.wait_for_service(timeout_sec=3.0)
 
         # Set arming yaw check tolerance on PX4
         if self.param_set_client.wait_for_service(timeout_sec=2.0):
@@ -414,10 +461,9 @@ class AutoMapper(Node):
 
         self.sleep_and_stream(0.5)
 
-        # 2. Takeoff
+        # 2. Automated Takeoff
         takeoff_ok = self.perform_takeoff(target_alt=self.target_altitude)
         if not takeoff_ok:
-            # Check once more if user took off manually
             if self.current_pose.pose.position.z >= 1.0:
                 self.get_logger().info('Manual takeoff detected! Proceeding with mission.')
             else:
@@ -425,7 +471,7 @@ class AutoMapper(Node):
                 return
 
         # 3. Enter OFFBOARD mode with pre-stream and lock
-        if not self.switch_to_offboard(pre_stream_sec=2.5):
+        if not self.switch_to_offboard(pre_stream_sec=2.0):
             self.get_logger().error('Could not engage OFFBOARD mode. Aborting mission.')
             return
 
@@ -437,11 +483,11 @@ class AutoMapper(Node):
             self.get_logger().info(f'Odometry locked! Initial inliers: {self.odom_inliers}')
 
         # 4. Phase 1: Discretized 360° Panoramic Scan (Step-and-Pause)
-        # 16 steps of ~22.5°: rotate gently at 0.18 rad/s for 2.18s, then pause 0.8s
+        # 16 steps of ~22.5°: rotate gently at 0.22 rad/s for 1.78s, then pause 0.8s
         total_steps = 16
         step_angle_deg = 360.0 / total_steps
-        yaw_speed = 0.18       # rad/s (~10.3 deg/s) - very gentle, zero motion blur
-        step_duration = (math.radians(step_angle_deg)) / yaw_speed  # ~2.18s
+        yaw_speed = 0.22       # rad/s (~12.6 deg/s) - smooth and gentle
+        step_duration = (math.radians(step_angle_deg)) / yaw_speed  # ~1.78s
         pause_duration = 0.8   # seconds of zero motion to allow SLAM keyframe registration
 
         self.get_logger().info(
@@ -452,7 +498,7 @@ class AutoMapper(Node):
             deg = step * step_angle_deg
             # Incremental rotation step with active tracking feedback and vz=0.0
             self.safe_motion(
-                vx=0.0, vy=0.0, vz=0.0, yaw_rate=yaw_speed,
+                v_forward=0.0, v_strafe_left=0.0, vz=0.0, yaw_rate=yaw_speed,
                 duration_sec=step_duration,
                 desc=f'Step {step}/{total_steps} ({deg:.0f}°)'
             )
@@ -464,21 +510,21 @@ class AutoMapper(Node):
         self.publish_zero_setpoint()
         self.sleep_and_stream(2.0)
 
-        # 5. Phase 2: Ultra-Smooth Survey Displacements (0.12 m/s, vz=0.0)
-        # Gentle translation at 0.12 m/s with strictly zero vertical velocity
-        # Each leg divided into 2 mini-segments with a 1.0s settle pause
+        # 5. Phase 2: Ultra-Smooth Survey Flight in Body Coordinates
+        # Speeds set to 0.30 m/s for clean, visible physical motion in Gazebo
+        # v_forward and v_strafe_left automatically transform to world ENU based on current yaw
         legs = [
-            ("Forward towards North Wall",       0.12,  0.0,  0.0, 5.0),
-            ("Strafe Right towards East Wall",   0.0, -0.12,  0.0, 5.0),
-            ("Backward towards South Wall",     -0.12,  0.0,  0.0, 5.0),
-            ("Strafe Left towards Center",       0.0,  0.12,  0.0, 5.0),
+            ("Forward towards North Wall",       0.30,  0.0,  0.0, 4.0),
+            ("Strafe Right towards East Wall",   0.0, -0.30,  0.0, 4.0),
+            ("Backward towards South Wall",     -0.30,  0.0,  0.0, 4.0),
+            ("Strafe Left towards Center",       0.0,  0.30,  0.0, 4.0),
         ]
 
-        self.get_logger().info('>>> PHASE 2: Ultra-Smooth Survey Flight (gentle translation @ 0.12 m/s, vz=0.0)...')
-        for desc, vx, vy, vz, duration in legs:
+        self.get_logger().info('>>> PHASE 2: Survey Flight (body-frame translation @ 0.30 m/s, vz=0.0)...')
+        for desc, v_fwd, v_lat, vz, duration in legs:
             # Segment 1
             self.safe_motion(
-                vx=vx, vy=vy, vz=0.0, yaw_rate=0.0,
+                v_forward=v_fwd, v_strafe_left=v_lat, vz=0.0, yaw_rate=0.0,
                 duration_sec=duration, desc=f'{desc} [Part 1]'
             )
             # Intermediate settle pause
@@ -487,7 +533,7 @@ class AutoMapper(Node):
 
             # Segment 2
             self.safe_motion(
-                vx=vx, vy=vy, vz=0.0, yaw_rate=0.0,
+                v_forward=v_fwd, v_strafe_left=v_lat, vz=0.0, yaw_rate=0.0,
                 duration_sec=duration, desc=f'{desc} [Part 2]'
             )
             # Intermediate settle pause
