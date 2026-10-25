@@ -2,64 +2,281 @@
 """
 Node: auto_mapper.py (drone_sim)
 =================================
-Autonomous SLAM Mapping Routine with Hybrid Setpoint Control (Horizontal Velocity + Fixed Z Position + Yaw Rate):
-  1. Hybrid Setpoint Control via /mavros/setpoint_raw/local:
-     - Uses mavros_msgs/msg/PositionTarget with type_mask=1507:
-         * Controls horizontal velocities (vx, vy in ENU converted from Body Frame).
-         * Locks vertical position rigidly at target_altitude (z = 1.5m), eliminating any altitude drop during yaw rotations.
-         * Controls yaw rate (yaw_rate in rad/s).
-     - type_mask = IGNORE_PX | IGNORE_PY | IGNORE_VZ | IGNORE_AFX | IGNORE_AFY | IGNORE_AFZ | IGNORE_YAW (= 1507).
-  2. Ground-Decoupled Odometry Feedback:
-     - Visual odometry health check is strictly BYPASSED on the ground (alt < 1.0m) to avoid liftoff paralysis.
-     - Active in-flight tracking feedback pauses into hover if camera tracking degrades.
-  3. Body-to-ENU Frame Velocity Transformation:
-     - Automatically converts Body-frame speeds (Forward, Strafe) into Local ENU velocities using current yaw heading.
-  4. Armored Autonomous Takeoff:
-     - Commands MAV_CMD_NAV_TAKEOFF (CommandLong 22) + CommandTOL with NaNs for in-place ascent.
-     - Sets AUTO.TAKEOFF, arms, and smoothly transitions into OFFBOARD mode.
+Map-Agnostic Autonomous Drone Exploration using Real-Time SLAM & Frontier Detection.
+
+Key Architectural Components:
+------------------------------
+1. Finite State Machine (FSM):
+   - INIT: FCU connection, odometry health verification, parameter tuning.
+   - TAKEOFF: Autonomous arming and climb to hover altitude.
+   - OFFBOARD_SYNC: Dynamic altitude capture, 50 Hz setpoint pre-streaming, OFFBOARD lock.
+   - PANORAMIC_SCAN: 360° discretized scan to seed initial 3D/2D occupancy grid around spawn.
+   - FRONTIER_EXPLORATION: Real-time map-based frontier detection, clustering, scoring, and navigation.
+   - RECOVERY: Active odometry monitoring; safe hover and micro-yaw on feature loss.
+   - RETURN_TO_HOME: Autonomous return to takeoff coordinates once exploration finishes.
+   - LAND: Controlled autonomous landing and disarm.
+   - DONE: Mission complete.
+
+2. Frontier Explorer (FrontierDetector):
+   - Subscribes to RTAB-Map OccupancyGrid (/rtabmap/grid_map).
+   - Generates obstacle inflation safety layer (scipy.ndimage.distance_transform_edt).
+   - Identifies boundaries between safe free space and unknown regions.
+   - Clusters contiguous frontiers (8-connectivity) and computes information gain, distance,
+     and heading alignment scores.
+   - Line-of-sight collision checking avoids straight-line obstacle collisions.
+   - Blacklisting mechanism prevents stagnation on unreachable or occluded targets.
+
+3. Hybrid Flight Control (PositionTarget):
+   - /mavros/setpoint_raw/local with type_mask=1507 (0x05E3):
+     * Controls horizontal velocities (vx, vy in ENU).
+     * Rigidly locks vertical position (z) to dynamic takeoff altitude (PX4 position PID).
+     * Controls yaw rate (yaw_rate in rad/s).
+   - Continuous 50 Hz heartbeat timer.
 """
 
 import math
 import time
+from enum import Enum, auto
+from dataclasses import dataclass
+from typing import Optional, List, Tuple, Dict
+
+import numpy as np
+from scipy.ndimage import binary_dilation, label, distance_transform_edt
+
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
-from nav_msgs.msg import Odometry
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Point
+from nav_msgs.msg import Odometry, OccupancyGrid
 from rtabmap_msgs.msg import OdomInfo
+from visualization_msgs.msg import Marker, MarkerArray
 from mavros_msgs.srv import CommandBool, CommandTOL, CommandLong, SetMode, ParamSet
 from mavros_msgs.msg import State, PositionTarget
 
 
+# ── FSM States ─────────────────────────────────────────────────────────────
+class DroneState(Enum):
+    INIT = auto()
+    TAKEOFF = auto()
+    OFFBOARD_SYNC = auto()
+    PANORAMIC_SCAN = auto()
+    FRONTIER_EXPLORATION = auto()
+    RECOVERY = auto()
+    RETURN_TO_HOME = auto()
+    LAND = auto()
+    DONE = auto()
+
+
+# ── Frontier Candidate ─────────────────────────────────────────────────────
+@dataclass
+class FrontierCandidate:
+    x: float            # Metric world X (meters)
+    y: float            # Metric world Y (meters)
+    size: int           # Cluster cell count (information gain metric)
+    score: float = 0.0  # Overall selection score
+    cluster_id: int = 0
+
+
+# ── Frontier Detection & Path Safety Engine ────────────────────────────────
+class FrontierDetector:
+    """
+    Processes 2D OccupancyGrids to extract obstacle-safe frontier clusters
+    and ranks them according to information gain, travel distance, and heading alignment.
+    """
+    def __init__(self,
+                 obstacle_inflation_m: float = 0.40,
+                 min_cluster_size: int = 4,
+                 max_range_m: float = 7.5,
+                 min_range_m: float = 0.38):
+        self.obstacle_inflation_m = obstacle_inflation_m
+        self.min_cluster_size = min_cluster_size
+        self.max_range_m = max_range_m
+        self.min_range_m = min_range_m
+
+    def detect_frontiers(self,
+                         grid_msg: OccupancyGrid,
+                         robot_x: float,
+                         robot_y: float,
+                         robot_yaw: float,
+                         blacklist: Dict[Tuple[float, float], float]) -> List[FrontierCandidate]:
+        """
+        Detects, clusters, and ranks frontier waypoints from the latest OccupancyGrid.
+        """
+        width = grid_msg.info.width
+        height = grid_msg.info.height
+        res = grid_msg.info.resolution
+        origin_x = grid_msg.info.origin.position.x
+        origin_y = grid_msg.info.origin.position.y
+
+        if width < 5 or height < 5 or res <= 0.0:
+            return []
+
+        # Convert to 2D numpy array: shape (height, width)
+        data_2d = np.array(grid_msg.data, dtype=np.int8).reshape((height, width))
+
+        # 1. Classification
+        unknown_mask = (data_2d == -1)
+        free_mask = (data_2d >= 0) & (data_2d < 25)
+        occupied_mask = (data_2d >= 50)
+
+        if not np.any(free_mask) or not np.any(unknown_mask):
+            return []
+
+        # 2. Obstacle inflation (Safety clearance)
+        if np.any(occupied_mask):
+            dist_to_obs = distance_transform_edt(~occupied_mask) * res
+            safe_free_mask = free_mask & (dist_to_obs >= self.obstacle_inflation_m)
+        else:
+            dist_to_obs = np.full((height, width), 999.0)
+            safe_free_mask = free_mask
+
+        # 3. Frontier cell detection: safe free cells adjacent to unknown cells
+        unknown_adjacent = binary_dilation(unknown_mask, structure=np.ones((3, 3)))
+        raw_frontiers = safe_free_mask & unknown_adjacent
+
+        if not np.any(raw_frontiers):
+            return []
+
+        # 4. Connected-component clustering (8-connectivity)
+        labeled_frontiers, num_features = label(raw_frontiers, structure=np.ones((3, 3)))
+        if num_features == 0:
+            return []
+
+        now = time.time()
+        candidates: List[FrontierCandidate] = []
+
+        for cid in range(1, num_features + 1):
+            cluster_mask = (labeled_frontiers == cid)
+            cluster_size = int(np.sum(cluster_mask))
+            if cluster_size < self.min_cluster_size:
+                continue
+
+            ys, xs = np.where(cluster_mask)
+            # Choose cell within cluster having greatest clearance from obstacles
+            best_idx = int(np.argmax(dist_to_obs[ys, xs]))
+            cy, cx = ys[best_idx], xs[best_idx]
+
+            wx = float(origin_x + (cx + 0.5) * res)
+            wy = float(origin_y + (cy + 0.5) * res)
+
+            # Euclidean distance to robot
+            dist = math.hypot(wx - robot_x, wy - robot_y)
+            if dist < self.min_range_m or dist > self.max_range_m:
+                continue
+
+            # Check blacklist (cooldown for unreachable/stagnant targets)
+            is_blacklisted = False
+            for (bx, by), expire_time in list(blacklist.items()):
+                if now < expire_time:
+                    if math.hypot(wx - bx, wy - by) < 0.5:
+                        is_blacklisted = True
+                        break
+                else:
+                    blacklist.pop((bx, by), None)
+
+            if is_blacklisted:
+                continue
+
+            # Line of sight check: reject if line directly hits an occupied obstacle
+            if not self.is_path_clear(data_2d, origin_x, origin_y, res, robot_x, robot_y, wx, wy):
+                continue
+
+            # Heading alignment (camera points forward)
+            bearing = math.atan2(wy - robot_y, wx - robot_x)
+            heading_err = abs(math.atan2(math.sin(bearing - robot_yaw), math.cos(bearing - robot_yaw)))
+
+            # Frontier utility score:
+            # High information gain (size), close distance, small heading deviation
+            score = (cluster_size ** 0.8) / (1.0 + 0.7 * dist + 0.3 * heading_err)
+
+            candidates.append(FrontierCandidate(
+                x=wx,
+                y=wy,
+                size=cluster_size,
+                score=score,
+                cluster_id=cid
+            ))
+
+        # Sort descending by score
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        return candidates
+
+    @staticmethod
+    def is_path_clear(grid: np.ndarray, origin_x: float, origin_y: float, res: float,
+                      x1: float, y1: float, x2: float, y2: float) -> bool:
+        """Checks if straight ray between (x1,y1) and (x2,y2) is obstacle-free."""
+        dist = math.hypot(x2 - x1, y2 - y1)
+        steps = max(int(dist / (res * 0.5)), 2)
+        xs = np.linspace(x1, x2, steps)
+        ys = np.linspace(y1, y2, steps)
+        c_indices = np.floor((xs - origin_x) / res).astype(int)
+        r_indices = np.floor((ys - origin_y) / res).astype(int)
+
+        H, W = grid.shape
+        valid = (c_indices >= 0) & (c_indices < W) & (r_indices >= 0) & (r_indices < H)
+        if not np.all(valid):
+            return False
+
+        # Any cell with probability >= 50 is an obstacle
+        return not np.any(grid[r_indices, c_indices] >= 50)
+
+
+# ── Main Autonomous Node ───────────────────────────────────────────────────
 class AutoMapper(Node):
     def __init__(self):
         super().__init__('auto_mapper')
 
-        # Ensure node uses simulation time from Gazebo
+        # Simulation Time Configuration
         if self.has_parameter('use_sim_time'):
             self.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)])
         else:
             self.declare_parameter('use_sim_time', True)
 
+        # Operational Parameters
+        self.cruising_speed = 0.18        # m/s (safe speed to eliminate motion blur in RTAB-Map)
+        self.target_altitude = 1.5        # Cruising altitude (dynamically updated on takeoff)
+        self.max_exploration_time = 360.0  # Max exploration duration before RTH (seconds)
+        self.max_frontier_duration = 22.0  # Stagnation timeout on a single frontier (seconds)
+
+        # Instantiate Frontier Detector
+        self.frontier_detector = FrontierDetector(
+            obstacle_inflation_m=0.40,
+            min_cluster_size=4,
+            max_range_m=7.5,
+            min_range_m=0.38
+        )
+
         # ── Publishers ─────────────────────────────────────────────
-        # 1. Primary Hybrid PositionTarget (Horizontal Velocity + Rigid Z Position Lock + Yaw Rate)
+        # 1. Primary Hybrid PositionTarget (Horizontal Velocity + Locked Z Position + Yaw Rate)
         self.raw_pub = self.create_publisher(
             PositionTarget,
             '/mavros/setpoint_raw/local',
             10
         )
 
-        # 2. Unstamped Twist (for compatibility)
+        # 2. Legacy Unstamped Twist
         self.vel_pub = self.create_publisher(
             Twist,
             '/mavros/setpoint_velocity/cmd_vel_unstamped',
             10
         )
 
-        # 3. Stamped Twist (canonical topic with explicit simulation timestamp)
+        # 3. Canonical Stamped Twist
         self.vel_stamped_pub = self.create_publisher(
             TwistStamped,
             '/mavros/setpoint_velocity/cmd_vel',
+            10
+        )
+
+        # 4. RViz Markers for Live Frontier Visualization
+        self.marker_pub = self.create_publisher(
+            MarkerArray,
+            '/exploration/frontiers',
+            10
+        )
+        self.target_marker_pub = self.create_publisher(
+            Marker,
+            '/exploration/active_target',
             10
         )
 
@@ -84,7 +301,6 @@ class AutoMapper(Node):
             qos_sensor
         )
 
-        # Visual Odometry Quality Feedback Subscribers
         self.odom_info_sub = self.create_subscription(
             OdomInfo,
             '/rtabmap/odom_info',
@@ -99,38 +315,67 @@ class AutoMapper(Node):
             qos_sensor
         )
 
+        # Map Subscriptions (Reliable + Transient Local QoS for RTAB-Map)
+        qos_map = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5
+        )
+
+        self.map_sub = self.create_subscription(
+            OccupancyGrid,
+            '/rtabmap/grid_map',
+            self.grid_map_cb,
+            qos_map
+        )
+        self.fallback_map_sub = self.create_subscription(
+            OccupancyGrid,
+            '/map',
+            self.grid_map_cb,
+            qos_map
+        )
+
         # ── Service Clients ────────────────────────────────────────
         self.arming_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
+        self.land_client = self.create_client(CommandTOL, '/mavros/cmd/land')
         self.cmd_long_client = self.create_client(CommandLong, '/mavros/cmd/command')
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.param_set_client = self.create_client(ParamSet, '/mavros/param/set')
 
-        # ── State Variables ────────────────────────────────────────
+        # ── State Machine & Tracking Variables ─────────────────────
+        self.state = DroneState.INIT
+        self.pre_recovery_state = DroneState.FRONTIER_EXPLORATION
         self.current_state = State()
         self.current_pose = PoseStamped()
-        self.target_altitude = 1.5  # Safe fixed cruising altitude (meters)
+        self.latest_grid: Optional[OccupancyGrid] = None
 
-        # Explicitly initialize Twist with clean 0.0 floats
+        # Takeoff / Home coordinates
+        self.home_pose: Tuple[float, float] = (0.0, 0.0)
+
+        # Exploration tracking
+        self.active_frontier: Optional[FrontierCandidate] = None
+        self.frontier_start_time = 0.0
+        self.blacklist: Dict[Tuple[float, float], float] = {}
+        self.mission_start_time = 0.0
+        self.consecutive_empty_frontiers = 0
+
+        # Odometry Health Monitoring
+        self.odom_received = False
+        self.odom_lost = False
+        self.odom_inliers = 0
+        self.odom_matches = 0
+        self.odom_has_nan = False
+        self.last_odom_time = 0.0
+
+        # Setpoint message templates
         self.cmd_twist = Twist()
-        self.cmd_twist.linear.x = 0.0
-        self.cmd_twist.linear.y = 0.0
-        self.cmd_twist.linear.z = 0.0
-        self.cmd_twist.angular.x = 0.0
-        self.cmd_twist.angular.y = 0.0
-        self.cmd_twist.angular.z = 0.0
-
-        # Hybrid PositionTarget Initialization:
-        # type_mask = 1507 (0x05E3):
-        #   - Ignore PX, PY (bits 1, 2)
-        #   - CONTROL PZ (bit 4 is 0) -> Rigid closed-loop altitude hold!
-        #   - CONTROL VX, VY (bits 8, 16 are 0) -> Velocity control in horizontal plane!
-        #   - Ignore VZ (bit 32)
-        #   - Ignore AFX, AFY, AFZ (bits 64, 128, 256)
-        #   - Ignore YAW (bit 1024)
-        #   - CONTROL YAW_RATE (bit 2048 is 0) -> Yaw rate control!
         self.cmd_raw = PositionTarget()
         self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        # type_mask = 1507 (0x05E3):
+        # Ignore PX, PY (1, 2) | Control PZ (0) | Control VX, VY (0) |
+        # Ignore VZ (32) | Ignore AFX, AFY, AFZ (448) | Ignore YAW (1024) | Control YAW_RATE (0)
         self.cmd_raw.type_mask = (
             PositionTarget.IGNORE_PX |
             PositionTarget.IGNORE_PY |
@@ -149,21 +394,15 @@ class AutoMapper(Node):
         self.cmd_raw.yaw = 0.0
         self.cmd_raw.yaw_rate = 0.0
 
-        # Odometry Health Monitoring
-        self.odom_received = False
-        self.odom_lost = False
-        self.odom_inliers = 0
-        self.odom_matches = 0
-        self.odom_has_nan = False
-        self.last_odom_time = 0.0
-
-        # Heartbeat timer: 50 Hz continuous setpoint stream
+        # 50 Hz Heartbeat streaming timer
         self.timer = self.create_timer(0.02, self.timer_cb)
+
         self.get_logger().info(
-            f'AutoMapper initialized (Hybrid Setpoint: vx, vy + locked z={self.target_altitude:.1f}m + yaw_rate). '
-            'Waiting for FCU connection...'
+            '>>> AutoMapper (Frontier Exploration) Node Initialized. '
+            'Connecting to FCU and awaiting SLAM occupancy grid...'
         )
 
+    # ── Callbacks ──────────────────────────────────────────────────────────
     def state_cb(self, msg: State):
         self.current_state = msg
 
@@ -181,13 +420,37 @@ class AutoMapper(Node):
         self.odom_received = True
         self.last_odom_time = time.time()
         p = msg.pose.pose.position
-        if not (math.isfinite(p.x) and math.isfinite(p.y) and math.isfinite(p.z)):
-            self.odom_has_nan = True
-        else:
-            self.odom_has_nan = False
+        self.odom_has_nan = not (math.isfinite(p.x) and math.isfinite(p.y) and math.isfinite(p.z))
+
+    def grid_map_cb(self, msg: OccupancyGrid):
+        self.latest_grid = msg
+
+    # ── Odometry Health Checker ────────────────────────────────────────────
+    def is_odometry_healthy(self) -> bool:
+        """Checks visual odometry tracking quality (bypassed on ground to allow liftoff)."""
+        alt = self.current_pose.pose.position.z
+        if alt < 1.0:
+            return True
+
+        if not self.odom_received:
+            return True
+
+        if time.time() - self.last_odom_time > 1.2:
+            return False
+
+        if self.odom_lost:
+            return False
+
+        if self.odom_inliers < 8:
+            return False
+
+        if self.odom_has_nan:
+            return False
+
+        return True
 
     def get_current_yaw(self) -> float:
-        """Extracts current yaw angle (radians) from FCU pose orientation quaternion."""
+        """Extracts yaw angle (radians) from FCU orientation quaternion."""
         q = self.current_pose.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
@@ -195,12 +458,9 @@ class AutoMapper(Node):
             return 0.0
         return math.atan2(siny_cosp, cosy_cosp)
 
+    # ── 50 Hz Heartbeat Streaming ──────────────────────────────────────────
     def timer_cb(self):
-        """
-        Dispatches hybrid setpoints at 50 Hz:
-        - PositionTarget on /mavros/setpoint_raw/local (vx, vy in ENU + locked z + yaw_rate).
-        - cmd_vel and cmd_vel_unstamped for legacy compatibility.
-        """
+        """Dispatches continuous 50 Hz hybrid setpoints to satisfy PX4 watchdog."""
         now = self.get_clock().now().to_msg()
 
         # 1. Primary Hybrid PositionTarget
@@ -219,24 +479,15 @@ class AutoMapper(Node):
         self.vel_stamped_pub.publish(stamped)
 
     def set_vel(self, vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0, target_z=None):
-        """
-        Sets linear and angular setpoints:
-        - vx, vy: commanded velocities in Local ENU frame.
-        - target_z: rigid position lock on altitude (defaults to self.target_altitude).
-        - yaw_rate: commanded rotation speed in rad/s.
-        """
+        """Sets linear and angular velocity commands with locked altitude."""
         self.cmd_twist.linear.x = float(vx)
         self.cmd_twist.linear.y = float(vy)
         self.cmd_twist.linear.z = float(vz)
-        self.cmd_twist.angular.x = 0.0
-        self.cmd_twist.angular.y = 0.0
         self.cmd_twist.angular.z = float(yaw_rate)
 
         if target_z is not None:
             self.target_altitude = float(target_z)
 
-        # Update PositionTarget fields:
-        # PX4 mc_pos_control enforces position loop on Z, velocity loop on X/Y, rate on Yaw
         self.cmd_raw.position.x = 0.0
         self.cmd_raw.position.y = 0.0
         self.cmd_raw.position.z = float(self.target_altitude)
@@ -246,110 +497,79 @@ class AutoMapper(Node):
         self.cmd_raw.yaw = 0.0
         self.cmd_raw.yaw_rate = float(yaw_rate)
 
-    def set_body_vel(self, v_forward=0.0, v_strafe_left=0.0, vz=0.0, yaw_rate=0.0, target_z=None):
-        """
-        Converts Body-frame speeds (Forward, Strafe Left) into Local ENU velocities (vx, vy)
-        using the drone's actual current yaw heading.
-        Altitude is locked rigidly to target_z (default 1.5m) so the drone cannot drop during yaw.
-        """
-        yaw = self.get_current_yaw()
-        vx_enu = float(v_forward) * math.cos(yaw) - float(v_strafe_left) * math.sin(yaw)
-        vy_enu = float(v_forward) * math.sin(yaw) + float(v_strafe_left) * math.cos(yaw)
-        self.set_vel(vx_enu, vy_enu, vz, yaw_rate, target_z=target_z)
-
     def publish_zero_setpoint(self, target_z=None):
-        """Zeros horizontal velocity and yaw rate, maintaining locked altitude."""
+        """Halts all horizontal and rotational motion while maintaining altitude lock."""
         self.set_vel(0.0, 0.0, 0.0, 0.0, target_z=target_z)
         self.timer_cb()
 
-    def is_odometry_healthy(self) -> bool:
-        """
-        Checks visual odometry tracking quality.
-        Bypassed when on ground (alt < 1.0m) to avoid blocking liftoff!
-        """
-        alt = self.current_pose.pose.position.z
-        if alt < 1.0:
-            return True
-
-        if not self.odom_received:
-            return True
-
-        # Stale data (>1.0s)
-        if time.time() - self.last_odom_time > 1.0:
-            return False
-
-        # Lost tracking flag from RTAB-Map
-        if self.odom_lost:
-            return False
-
-        # Inlier threshold (< 8 is degraded in flight)
-        if self.odom_inliers < 8:
-            return False
-
-        # Coordinates corrupted by NaN or Inf
-        if self.odom_has_nan:
-            return False
-
-        return True
-
-    def sleep_and_stream(self, duration_sec):
-        """Streams current setpoints at 50Hz without blocking the ROS executor."""
+    def sleep_and_stream(self, duration_sec: float):
+        """Maintains 50 Hz setpoint streaming without blocking ROS executor."""
         end_time = time.time() + duration_sec
         while rclpy.ok() and time.time() < end_time:
             self.timer_cb()
             rclpy.spin_once(self, timeout_sec=0.02)
             time.sleep(0.02)
 
-    def safe_motion(self, v_forward=0.0, v_strafe_left=0.0, vz=0.0, yaw_rate=0.0, duration_sec=1.0, desc=""):
-        """
-        Executes a motion step in drone body frame with active odometry health feedback.
-        Altitude is maintained locked at self.target_altitude (1.5m).
-        """
-        if desc:
-            self.get_logger().info(f'-> Motion: {desc} (dur: {duration_sec:.1f}s, alt: {self.target_altitude:.1f}m)')
+    # ── RViz Visualization Markers ─────────────────────────────────────────
+    def publish_frontier_markers(self, candidates: List[FrontierCandidate], active: Optional[FrontierCandidate]):
+        """Publishes detected frontiers and active target waypoint to RViz."""
+        now = self.get_clock().now().to_msg()
 
-        time_moved = 0.0
-        dt = 0.02
+        # 1. Cluster Markers
+        marker_array = MarkerArray()
+        # Delete old markers
+        del_marker = Marker()
+        del_marker.action = Marker.DELETEALL
+        marker_array.markers.append(del_marker)
 
-        while rclpy.ok() and time_moved < duration_sec:
-            # Feedback quality check (active only when airborne):
-            if not self.is_odometry_healthy():
-                self.get_logger().warn(
-                    f'[ODOM FEEDBACK] Tracking degraded (lost={self.odom_lost}, inliers={self.odom_inliers})! '
-                    'Halting into hover until camera settles...'
-                )
-                self.publish_zero_setpoint()
+        for i, c in enumerate(candidates):
+            m = Marker()
+            m.header.frame_id = 'map'
+            m.header.stamp = now
+            m.ns = 'frontiers'
+            m.id = i + 1
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = c.x
+            m.pose.position.y = c.y
+            m.pose.position.z = self.target_altitude
+            m.scale.x = 0.25
+            m.scale.y = 0.25
+            m.scale.z = 0.25
+            # Cyan color for frontiers
+            m.color.r = 0.0
+            m.color.g = 0.8
+            m.color.b = 1.0
+            m.color.a = 0.8
+            marker_array.markers.append(m)
 
-                # Hold hover until odometry stays healthy continuously for 1.0s
-                stable_duration = 0.0
-                while rclpy.ok() and stable_duration < 1.0:
-                    self.sleep_and_stream(dt)
-                    if self.is_odometry_healthy():
-                        stable_duration += dt
-                    else:
-                        stable_duration = 0.0
+        self.marker_pub.publish(marker_array)
 
-                self.get_logger().info(
-                    f'[ODOM FEEDBACK] Tracking recovered (inliers={self.odom_inliers})! Resuming motion.'
-                )
+        # 2. Active Target Marker
+        if active is not None:
+            tm = Marker()
+            tm.header.frame_id = 'map'
+            tm.header.stamp = now
+            tm.ns = 'active_target'
+            tm.id = 999
+            tm.type = Marker.CYLINDER
+            tm.action = Marker.ADD
+            tm.pose.position.x = active.x
+            tm.pose.position.y = active.y
+            tm.pose.position.z = self.target_altitude
+            tm.scale.x = 0.35
+            tm.scale.y = 0.35
+            tm.scale.z = 0.60
+            # Gold / Yellow-Orange color for active target
+            tm.color.r = 1.0
+            tm.color.g = 0.65
+            tm.color.b = 0.0
+            tm.color.a = 0.95
+            self.target_marker_pub.publish(tm)
 
-            # Command body velocity converted to ENU while locking altitude
-            self.set_body_vel(v_forward, v_strafe_left, vz, yaw_rate, target_z=self.target_altitude)
-            self.sleep_and_stream(dt)
-            time_moved += dt
-
-        # Stop horizontal velocity at end of step
-        self.publish_zero_setpoint()
-
-    def perform_takeoff(self, target_alt=1.5) -> bool:
-        """
-        Armored autonomous takeoff routine:
-        - If already airborne (e.g. manual commander takeoff), detects it and proceeds immediately.
-        - Commands MAV_CMD_NAV_TAKEOFF (CommandLong command 22) with NaNs for in-place vertical liftoff.
-        - Commands CommandTOL with NaNs and requests AUTO.TAKEOFF flight mode.
-        - Arms the vehicle and monitors climb until target hover altitude (>=1.3m) is reached.
-        """
-        # 1. Check if already airborne
+    # ── Takeoff & Mode Switching Routines ──────────────────────────────────
+    def perform_takeoff(self, target_alt: float = 1.5) -> bool:
+        """Executes armored automated takeoff and dynamic altitude synchronization."""
         alt = self.current_pose.pose.position.z
         if alt >= 1.0 and self.current_state.armed:
             self.target_altitude = float(alt)
@@ -362,12 +582,9 @@ class AutoMapper(Node):
 
         self.get_logger().info(f'Initiating automatic takeoff to {target_alt:.1f}m...')
         self.target_altitude = float(target_alt)
-
-        # Ensure setpoint stream is active (required for MAVROS/PX4 offboard watchdog)
         self.publish_zero_setpoint(target_z=self.target_altitude)
         self.sleep_and_stream(1.0)
 
-        # 2. Multi-stage takeoff commands:
         for attempt in range(1, 6):
             alt = self.current_pose.pose.position.z
             if alt >= 1.2:
@@ -376,20 +593,20 @@ class AutoMapper(Node):
 
             self.get_logger().info(f'Takeoff attempt {attempt}/5...')
 
-            # A. Send MAV_CMD_NAV_TAKEOFF via CommandLong (exact equivalent of PX4 "commander takeoff")
+            # A. Send MAV_CMD_NAV_TAKEOFF (CommandLong 22)
             if self.cmd_long_client.service_is_ready():
                 cl_req = CommandLong.Request()
                 cl_req.broadcast = False
                 cl_req.command = 22  # MAV_CMD_NAV_TAKEOFF
                 cl_req.confirmation = 0
-                cl_req.param1 = 0.0          # pitch
-                cl_req.param4 = float('nan') # yaw
-                cl_req.param5 = float('nan') # lat (NaN = takeoff from current position)
-                cl_req.param6 = float('nan') # lon (NaN = takeoff from current position)
-                cl_req.param7 = float('nan') # alt (NaN = use MIS_TAKEOFF_ALT)
+                cl_req.param1 = 0.0
+                cl_req.param4 = float('nan')
+                cl_req.param5 = float('nan')
+                cl_req.param6 = float('nan')
+                cl_req.param7 = float('nan')
                 self.cmd_long_client.call_async(cl_req)
 
-            # B. Send CommandTOL with NaNs for local in-place takeoff
+            # B. Send CommandTOL
             if self.takeoff_client.service_is_ready():
                 t_req = CommandTOL.Request()
                 t_req.min_pitch = 0.0
@@ -399,13 +616,13 @@ class AutoMapper(Node):
                 t_req.altitude = float(target_alt)
                 self.takeoff_client.call_async(t_req)
 
-            # C. Request AUTO.TAKEOFF mode
+            # C. Request AUTO.TAKEOFF
             if self.mode_client.service_is_ready():
                 m_req = SetMode.Request()
                 m_req.custom_mode = 'AUTO.TAKEOFF'
                 self.mode_client.call_async(m_req)
 
-            # D. Request Arming
+            # D. Arming
             if not self.current_state.armed and self.arming_client.service_is_ready():
                 a_req = CommandBool.Request()
                 a_req.value = True
@@ -413,7 +630,7 @@ class AutoMapper(Node):
 
             self.sleep_and_stream(1.0)
 
-        # 3. Wait for vehicle to climb to target hover altitude
+        # Monitor climb
         t_start = time.time()
         step = 0
         while rclpy.ok() and (time.time() - t_start < 15.0):
@@ -436,7 +653,7 @@ class AutoMapper(Node):
         else:
             self.get_logger().warn(
                 f'Takeoff altitude low ({current_alt:.2f}m). '
-                'Tip: you can enter "commander takeoff" in Terminal 1 if FCU requires manual authorization.'
+                'Tip: enter "commander takeoff" in PX4 shell if FCU requires manual authorization.'
             )
             return False
 
@@ -444,19 +661,8 @@ class AutoMapper(Node):
         self.sleep_and_stream(1.0)
         return True
 
-    def switch_to_offboard(self, pre_stream_sec=2.0, max_wait_sec=8.0) -> bool:
-        """
-        Transitions cleanly and securely to OFFBOARD mode:
-        1. Reads and adopts actual current altitude if airborne.
-        2. Pre-streams hybrid setpoints (vx=0.0, vy=0.0, pz=target_altitude, yaw_rate=0.0)
-           for 2.0s at 50 Hz to prime PX4's offboard signal monitor.
-        3. Sends SetMode('OFFBOARD') request while continuously maintaining the 50 Hz stream.
-        4. Verifies actual switch to OFFBOARD in self.current_state.mode, retrying if needed.
-        5. Dynamically captures the exact altitude at the moment of OFFBOARD confirmation
-           and sets it as the permanent target_altitude.
-        6. Holds hover for 2.0s to allow PX4's altitude hold controller to fully engage.
-        """
-        # Step 0: Ensure target_altitude matches the actual altitude right now before pre-streaming
+    def switch_to_offboard(self, pre_stream_sec: float = 2.0, max_wait_sec: float = 8.0) -> bool:
+        """Transitions cleanly to OFFBOARD mode with dynamic altitude lock."""
         actual_z = self.current_pose.pose.position.z
         if actual_z >= 0.8:
             self.target_altitude = float(actual_z)
@@ -477,8 +683,7 @@ class AutoMapper(Node):
             self.get_logger().info(f'Vehicle already in OFFBOARD mode at altitude {self.target_altitude:.2f}m.')
             return True
 
-        self.get_logger().info('>>> Step 2/3: Sending OFFBOARD mode switch request while maintaining 50Hz stream...')
-        
+        self.get_logger().info('>>> Step 2/3: Sending OFFBOARD mode switch request...')
         req = SetMode.Request()
         req.custom_mode = 'OFFBOARD'
         if self.mode_client.service_is_ready():
@@ -493,7 +698,6 @@ class AutoMapper(Node):
             time.sleep(0.02)
 
             if self.current_state.mode == 'OFFBOARD':
-                # Dynamically capture and lock the exact altitude at the moment of OFFBOARD confirmation!
                 confirmed_alt = self.current_pose.pose.position.z
                 if confirmed_alt >= 0.8:
                     self.target_altitude = float(confirmed_alt)
@@ -505,9 +709,7 @@ class AutoMapper(Node):
                 self.publish_zero_setpoint(target_z=self.target_altitude)
                 break
 
-            # Retry request every 1.0s if mode hasn't switched yet
             if time.time() - last_req_time >= 1.0:
-                self.get_logger().info(f'Retrying OFFBOARD request... (current mode: {self.current_state.mode})')
                 if self.mode_client.service_is_ready():
                     self.mode_client.call_async(req)
                 last_req_time = time.time()
@@ -516,7 +718,6 @@ class AutoMapper(Node):
             self.get_logger().error(f'Failed to switch to OFFBOARD mode! Current mode: {self.current_state.mode}')
             return False
 
-        # Settle in OFFBOARD hover to let PX4 altitude hold engage cleanly at the captured altitude
         self.get_logger().info(
             f'>>> Step 3/3: Holding stable OFFBOARD hover for 2.0s at locked z={self.target_altitude:.2f}m...'
         )
@@ -524,134 +725,383 @@ class AutoMapper(Node):
         self.sleep_and_stream(2.0)
         return True
 
-    def run_mapping_mission(self):
-        # 1. Wait for MAVROS FCU connection
+    # ── Recovery Behavior on Tracking Degradation ──────────────────────────
+    def handle_recovery(self):
+        """Safely recovers visual tracking without erratic flight movements."""
+        self.get_logger().warn(
+            f'[RECOVERY] Visual tracking degraded (lost={self.odom_lost}, inliers={self.odom_inliers})! '
+            'Halting into hover...'
+        )
+        self.publish_zero_setpoint(target_z=self.target_altitude)
+
+        # 1. Settle in hover for up to 3.0 seconds
+        t_start = time.time()
+        recovered = False
+        while rclpy.ok() and time.time() - t_start < 3.0:
+            self.sleep_and_stream(0.05)
+            if self.is_odometry_healthy():
+                recovered = True
+                break
+
+        # 2. If still lost, perform gentle micro-yaw in place (+0.12 rad/s)
+        if not recovered:
+            self.get_logger().info(
+                '[RECOVERY] Odometry still lost. Performing gentle micro-yaw in place to re-acquire visual keyframes...'
+            )
+            yaw_start = time.time()
+            while rclpy.ok() and time.time() - yaw_start < 4.0:
+                self.set_vel(vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.12, target_z=self.target_altitude)
+                self.sleep_and_stream(0.05)
+                if self.is_odometry_healthy():
+                    self.get_logger().info('[RECOVERY] Visual landmarks re-acquired!')
+                    break
+
+        # Settle in hover
+        self.publish_zero_setpoint(target_z=self.target_altitude)
+        self.sleep_and_stream(1.0)
+        self.get_logger().info('[RECOVERY] Resuming exploration.')
+
+    # ── Frontier Navigation Controller ─────────────────────────────────────
+    def navigate_towards(self, target_x: float, target_y: float) -> Tuple[bool, float]:
+        """
+        Commands proportional velocity towards (target_x, target_y) while turning
+        the forward-facing camera to face the frontier.
+        Returns: (arrived: bool, remaining_distance: float)
+        """
+        robot_x = self.current_pose.pose.position.x
+        robot_y = self.current_pose.pose.position.y
+        robot_yaw = self.get_current_yaw()
+
+        dx = target_x - robot_x
+        dy = target_y - robot_y
+        dist = math.hypot(dx, dy)
+
+        # Arrival threshold
+        if dist < 0.38:
+            return True, dist
+
+        # Heading calculation
+        target_bearing = math.atan2(dy, dx)
+        yaw_err = math.atan2(math.sin(target_bearing - robot_yaw), math.cos(target_bearing - robot_yaw))
+
+        # Proportional yaw rate control (clamped between -0.22 and 0.22 rad/s)
+        yaw_rate = float(np.clip(1.0 * yaw_err, -0.22, 0.22))
+
+        # Velocity scaling: if pointing away (>50°), prioritize turning before translating
+        if abs(yaw_err) > math.radians(50):
+            speed = 0.04
+        else:
+            speed = float(np.clip(0.40 * dist, 0.06, self.cruising_speed))
+
+        # Velocity vector in local ENU frame
+        vx_enu = speed * math.cos(target_bearing)
+        vy_enu = speed * math.sin(target_bearing)
+
+        # Dispatch hybrid command
+        self.set_vel(vx=vx_enu, vy=vy_enu, vz=0.0, yaw_rate=yaw_rate, target_z=self.target_altitude)
+        return False, dist
+
+    # ── Autonomous Landing Routine ─────────────────────────────────────────
+    def execute_landing(self):
+        """Safely commands autonomous descent and monitors touchdown."""
+        self.get_logger().info('>>> Initiating safe autonomous landing...')
+        self.publish_zero_setpoint(target_z=self.target_altitude)
+        self.sleep_and_stream(1.5)
+
+        # Request AUTO.LAND mode
+        if self.mode_client.service_is_ready():
+            m_req = SetMode.Request()
+            m_req.custom_mode = 'AUTO.LAND'
+            self.mode_client.call_async(m_req)
+
+        # Also trigger land service as backup
+        if self.land_client.service_is_ready():
+            l_req = CommandTOL.Request()
+            l_req.min_pitch = 0.0
+            l_req.yaw = float('nan')
+            l_req.latitude = float('nan')
+            l_req.longitude = float('nan')
+            l_req.altitude = 0.0
+            self.land_client.call_async(l_req)
+
+        t_land = time.time()
+        while rclpy.ok() and (time.time() - t_land < 25.0):
+            rclpy.spin_once(self, timeout_sec=0.1)
+            time.sleep(0.1)
+            alt = self.current_pose.pose.position.z
+            if alt < 0.25 or not self.current_state.armed:
+                self.get_logger().info(f'Touchdown confirmed at {alt:.2f}m. Vehicle disarmed.')
+                break
+
+    # ── Main FSM Mission Loop ──────────────────────────────────────────────
+    def run_exploration_mission(self):
+        """Central Finite State Machine overseeing the entire autonomous routine."""
+        # 1. State: INIT
+        self.state = DroneState.INIT
+        self.get_logger().info('=== [FSM: INIT] Waiting for FCU Connection ===')
         while rclpy.ok() and not self.current_state.connected:
             self.get_logger().info('Connecting to FCU...')
             rclpy.spin_once(self, timeout_sec=0.1)
             time.sleep(0.5)
 
-        self.get_logger().info('FCU Connected!')
-
-        # Wait for essential services ahead of time to avoid blocking during flight
+        self.get_logger().info('FCU Connected! Waiting for services...')
         self.mode_client.wait_for_service(timeout_sec=3.0)
         self.arming_client.wait_for_service(timeout_sec=3.0)
         self.takeoff_client.wait_for_service(timeout_sec=3.0)
+        self.land_client.wait_for_service(timeout_sec=3.0)
         self.cmd_long_client.wait_for_service(timeout_sec=3.0)
 
-        # Set arming yaw check tolerance on PX4
         if self.param_set_client.wait_for_service(timeout_sec=2.0):
-            p_req2 = ParamSet.Request()
-            p_req2.param_id = 'COM_ARM_EKF_YAW'
-            p_req2.value.real = 5.0
-            self.param_set_client.call_async(p_req2)
+            p_req = ParamSet.Request()
+            p_req.param_id = 'COM_ARM_EKF_YAW'
+            p_req.value.real = 5.0
+            self.param_set_client.call_async(p_req)
 
         self.sleep_and_stream(0.5)
 
-        # 2. Automated Takeoff to 1.5m
+        # 2. State: TAKEOFF
+        self.state = DroneState.TAKEOFF
+        self.get_logger().info('=== [FSM: TAKEOFF] Initiating Autonomous Liftoff ===')
         takeoff_ok = self.perform_takeoff(target_alt=self.target_altitude)
         if not takeoff_ok:
             if self.current_pose.pose.position.z >= 1.0:
-                self.get_logger().info('Manual takeoff detected! Proceeding with mission.')
+                self.get_logger().info('Manual takeoff detected! Proceeding.')
             else:
-                self.get_logger().error('Could not achieve takeoff. Aborting mission.')
+                self.get_logger().error('Could not achieve takeoff. Aborting.')
                 return
 
-        # 3. Enter OFFBOARD mode with pre-stream and lock
+        # 3. State: OFFBOARD_SYNC
+        self.state = DroneState.OFFBOARD_SYNC
+        self.get_logger().info('=== [FSM: OFFBOARD_SYNC] Synchronizing Dynamic Altitude & Engaging OFFBOARD ===')
         if not self.switch_to_offboard(pre_stream_sec=2.0):
-            self.get_logger().error('Could not engage OFFBOARD mode. Aborting mission.')
+            self.get_logger().error('Could not engage OFFBOARD mode. Aborting.')
             return
 
-        # Settle in hover to acquire initial visual features
-        self.get_logger().info(f'Holding initial hover at {self.target_altitude:.2f}m to lock visual odometry...')
-        self.publish_zero_setpoint(target_z=self.target_altitude)
-        self.sleep_and_stream(2.0)
-        if self.odom_received:
-            self.get_logger().info(f'Odometry locked! Initial inliers: {self.odom_inliers}')
-
-        # 4. Phase 1: Discretized 360° Panoramic Scan (Step-and-Pause)
-        # 16 steps of ~22.5°: rotate gently at 0.22 rad/s for 1.78s, then pause 0.8s
-        # Altitude is rigidly held at self.target_altitude by PX4's position PID!
-        total_steps = 16
-        step_angle_deg = 360.0 / total_steps
-        yaw_speed = 0.22       # rad/s (~12.6 deg/s) - smooth and gentle
-        step_duration = (math.radians(step_angle_deg)) / yaw_speed  # ~1.78s
-        pause_duration = 0.8   # seconds of zero motion to allow SLAM keyframe registration
-
-        self.get_logger().info(
-            f'>>> PHASE 1: Discretized 360° Panoramic Scan ({total_steps} steps of {step_angle_deg:.1f}° at locked z={self.target_altitude:.2f}m)...'
+        # Record Home Pose for RTH
+        self.home_pose = (
+            float(self.current_pose.pose.position.x),
+            float(self.current_pose.pose.position.y)
         )
+        self.get_logger().info(
+            f'Home coordinates locked: X={self.home_pose[0]:.2f}, Y={self.home_pose[1]:.2f}, '
+            f'Altitude={self.target_altitude:.2f}m'
+        )
+
+        # 4. State: PANORAMIC_SCAN
+        self.state = DroneState.PANORAMIC_SCAN
+        self.get_logger().info('=== [FSM: PANORAMIC_SCAN] Executing Initial 360° Localization & Map Seeding ===')
+        total_steps = 12
+        step_angle_deg = 360.0 / total_steps
+        yaw_speed = 0.22  # rad/s (~12.6 deg/s)
+        step_duration = math.radians(step_angle_deg) / yaw_speed
+        pause_duration = 0.8
 
         for step in range(1, total_steps + 1):
             deg = step * step_angle_deg
-            self.safe_motion(
-                v_forward=0.0, v_strafe_left=0.0, vz=0.0, yaw_rate=yaw_speed,
-                duration_sec=step_duration,
-                desc=f'Step {step}/{total_steps} ({deg:.0f}°)'
-            )
-            # Settle pause for camera stabilization and keyframe extraction
+            # Incremental yaw step
+            t_rot = time.time()
+            while rclpy.ok() and (time.time() - t_rot < step_duration):
+                if not self.is_odometry_healthy():
+                    self.handle_recovery()
+                self.set_vel(vx=0.0, vy=0.0, vz=0.0, yaw_rate=yaw_speed, target_z=self.target_altitude)
+                self.sleep_and_stream(0.02)
+
             self.publish_zero_setpoint(target_z=self.target_altitude)
             self.sleep_and_stream(pause_duration)
+            self.get_logger().info(f'Panoramic Scan: Step {step}/{total_steps} ({deg:.0f}° completed)')
 
-        self.get_logger().info(f'>>> 360° Panoramic Scan Complete! Settle hover at {self.target_altitude:.2f}m for 2s...')
+        self.get_logger().info('>>> Panoramic Map Seeding Complete! Settle hover for 2s...')
         self.publish_zero_setpoint(target_z=self.target_altitude)
         self.sleep_and_stream(2.0)
 
-        # 5. Phase 2: Ultra-Smooth Survey Flight in Body Coordinates
-        # Speeds reduced to 0.18 m/s for safe, blur-free visual feature tracking in RTAB-Map
-        # v_forward and v_strafe_left automatically transform to world ENU based on current yaw
-        # Altitude is held rigidly at self.target_altitude!
-        survey_speed = 0.18  # m/s (safe speed to eliminate motion blur and feature loss)
-        legs = [
-            ("Forward towards North Wall",       survey_speed,          0.0,  0.0, 4.0),
-            ("Strafe Right towards East Wall",            0.0, -survey_speed,  0.0, 4.0),
-            ("Backward towards South Wall",     -survey_speed,          0.0,  0.0, 4.0),
-            ("Strafe Left towards Center",                0.0,  survey_speed,  0.0, 4.0),
-        ]
+        # Wait for the first valid occupancy grid from RTAB-Map
+        self.get_logger().info('Waiting for initial RTAB-Map occupancy grid...')
+        t_map_wait = time.time()
+        while rclpy.ok() and self.latest_grid is None and (time.time() - t_map_wait < 10.0):
+            self.sleep_and_stream(0.2)
 
-        self.get_logger().info(
-            f'>>> PHASE 2: Survey Flight (body-frame translation @ {survey_speed:.2f} m/s, locked z={self.target_altitude:.2f}m)...'
-        )
-        for desc, v_fwd, v_lat, vz, duration in legs:
-            # Segment 1
-            self.safe_motion(
-                v_forward=v_fwd, v_strafe_left=v_lat, vz=0.0, yaw_rate=0.0,
-                duration_sec=duration, desc=f'{desc} [Part 1]'
+        if self.latest_grid is not None:
+            self.get_logger().info(
+                f'Occupancy Grid received ({self.latest_grid.info.width}x{self.latest_grid.info.height} @ '
+                f'{self.latest_grid.info.resolution:.2f}m/cell). Starting Frontier Exploration!'
             )
-            # Intermediate settle pause
-            self.publish_zero_setpoint(target_z=self.target_altitude)
-            self.sleep_and_stream(1.0)
+        else:
+            self.get_logger().warn('No OccupancyGrid received yet. Exploration will proceed as soon as map arrives.')
 
-            # Segment 2
-            self.safe_motion(
-                v_forward=v_fwd, v_strafe_left=v_lat, vz=0.0, yaw_rate=0.0,
-                duration_sec=duration, desc=f'{desc} [Part 2]'
-            )
-            # Intermediate settle pause
-            self.publish_zero_setpoint(target_z=self.target_altitude)
-            self.sleep_and_stream(1.0)
+        # 5. State: FRONTIER_EXPLORATION
+        self.state = DroneState.FRONTIER_EXPLORATION
+        self.get_logger().info('=== [FSM: FRONTIER_EXPLORATION] Entering Dynamic Map-Agnostic Exploration ===')
+        self.mission_start_time = time.time()
 
-        # 6. Complete and Hold Center Position
-        self.publish_zero_setpoint(target_z=self.target_altitude)
-        self.get_logger().info(
-            f'>>> Autonomous Mapping Mission Complete! 3D Map and 2D Grid are populated. '
-            f'Drone holding stable hover at center (locked z={self.target_altitude:.2f}m).'
-        )
         while rclpy.ok():
-            self.sleep_and_stream(0.5)
+            # Check maximum mission duration
+            elapsed_mission = time.time() - self.mission_start_time
+            if elapsed_mission > self.max_exploration_time:
+                self.get_logger().info(
+                    f'>>> Max exploration time reached ({elapsed_mission:.1f}s / {self.max_exploration_time:.1f}s). '
+                    'Transitioning to Return-To-Home.'
+                )
+                break
+
+            # Active Odometry Quality Guard
+            if not self.is_odometry_healthy():
+                self.handle_recovery()
+                continue
+
+            # Need valid occupancy grid to plan
+            if self.latest_grid is None:
+                self.publish_zero_setpoint(target_z=self.target_altitude)
+                self.sleep_and_stream(0.2)
+                continue
+
+            robot_x = self.current_pose.pose.position.x
+            robot_y = self.current_pose.pose.position.y
+            robot_yaw = self.get_current_yaw()
+
+            # If no active frontier, extract candidates and choose best
+            if self.active_frontier is None:
+                candidates = self.frontier_detector.detect_frontiers(
+                    grid_msg=self.latest_grid,
+                    robot_x=robot_x,
+                    robot_y=robot_y,
+                    robot_yaw=robot_yaw,
+                    blacklist=self.blacklist
+                )
+
+                self.publish_frontier_markers(candidates, active=None)
+
+                if candidates:
+                    self.active_frontier = candidates[0]
+                    self.frontier_start_time = time.time()
+                    self.consecutive_empty_frontiers = 0
+                    self.get_logger().info(
+                        f'-> Selected Frontier: (X: {self.active_frontier.x:.2f}, Y: {self.active_frontier.y:.2f}) '
+                        f'| Cluster Size: {self.active_frontier.size} cells | Score: {self.active_frontier.score:.1f}'
+                    )
+                    self.publish_frontier_markers(candidates, active=self.active_frontier)
+                else:
+                    self.consecutive_empty_frontiers += 1
+                    if self.consecutive_empty_frontiers <= 2:
+                        self.get_logger().info(
+                            f'No frontiers found in current view ({self.consecutive_empty_frontiers}/2). '
+                            'Performing 90° exploratory pivot...'
+                        )
+                        # Perform small exploratory pivot in place
+                        t_piv = time.time()
+                        while rclpy.ok() and time.time() - t_piv < 2.0:
+                            if not self.is_odometry_healthy():
+                                self.handle_recovery()
+                            self.set_vel(vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.22, target_z=self.target_altitude)
+                            self.sleep_and_stream(0.02)
+                        self.publish_zero_setpoint(target_z=self.target_altitude)
+                        self.sleep_and_stream(1.0)
+                        continue
+                    else:
+                        self.get_logger().info(
+                            '>>> No reachable frontiers remaining! Entire environment mapped. '
+                            'Transitioning to Return-To-Home.'
+                        )
+                        break
+
+            # If active frontier is set, navigate towards it
+            if self.active_frontier is not None:
+                # 1. Stagnation timeout check
+                if time.time() - self.frontier_start_time > self.max_frontier_duration:
+                    self.get_logger().warn(
+                        f'Frontier at ({self.active_frontier.x:.2f}, {self.active_frontier.y:.2f}) timed out '
+                        '(unreachable or blocked). Blacklisting for 60s.'
+                    )
+                    b_key = (round(self.active_frontier.x, 1), round(self.active_frontier.y, 1))
+                    self.blacklist[b_key] = time.time() + 60.0
+                    self.active_frontier = None
+                    self.publish_zero_setpoint(target_z=self.target_altitude)
+                    self.sleep_and_stream(1.0)
+                    continue
+
+                # 2. Dynamic path collision check
+                data_2d = np.array(self.latest_grid.data, dtype=np.int8).reshape(
+                    (self.latest_grid.info.height, self.latest_grid.info.width)
+                )
+                path_clear = self.frontier_detector.is_path_clear(
+                    grid=data_2d,
+                    origin_x=self.latest_grid.info.origin.position.x,
+                    origin_y=self.latest_grid.info.origin.position.y,
+                    res=self.latest_grid.info.resolution,
+                    x1=robot_x, y1=robot_y,
+                    x2=self.active_frontier.x, y2=self.active_frontier.y
+                )
+
+                if not path_clear:
+                    self.get_logger().warn(
+                        f'Direct path to frontier ({self.active_frontier.x:.2f}, {self.active_frontier.y:.2f}) '
+                        'now blocked by obstacle! Blacklisting for 45s.'
+                    )
+                    b_key = (round(self.active_frontier.x, 1), round(self.active_frontier.y, 1))
+                    self.blacklist[b_key] = time.time() + 45.0
+                    self.active_frontier = None
+                    self.publish_zero_setpoint(target_z=self.target_altitude)
+                    self.sleep_and_stream(1.0)
+                    continue
+
+                # 3. Step motion towards frontier
+                arrived, dist = self.navigate_towards(self.active_frontier.x, self.active_frontier.y)
+
+                if arrived:
+                    self.get_logger().info(
+                        f'>>> Frontier at ({self.active_frontier.x:.2f}, {self.active_frontier.y:.2f}) reached! '
+                        'Pausing 1.5s in hover to integrate new SLAM keyframes...'
+                    )
+                    self.publish_zero_setpoint(target_z=self.target_altitude)
+                    self.sleep_and_stream(1.5)
+                    self.active_frontier = None
+                    self.consecutive_empty_frontiers = 0
+                else:
+                    self.sleep_and_stream(0.04)
+
+        # 6. State: RETURN_TO_HOME
+        self.state = DroneState.RETURN_TO_HOME
+        self.get_logger().info('=== [FSM: RETURN_TO_HOME] Returning to Takeoff Position ===')
+        home_x, home_y = self.home_pose
+
+        t_rth_start = time.time()
+        while rclpy.ok() and (time.time() - t_rth_start < 45.0):
+            if not self.is_odometry_healthy():
+                self.handle_recovery()
+                continue
+
+            arrived, dist = self.navigate_towards(home_x, home_y)
+            if arrived or dist < 0.35:
+                self.get_logger().info(
+                    f'>>> Returned to Home Position (dist={dist:.2f}m)! Stabilizing for 2.0s...'
+                )
+                self.publish_zero_setpoint(target_z=self.target_altitude)
+                self.sleep_and_stream(2.0)
+                break
+            self.sleep_and_stream(0.04)
+
+        # 7. State: LAND
+        self.state = DroneState.LAND
+        self.get_logger().info('=== [FSM: LAND] Executing Autonomous Landing ===')
+        self.execute_landing()
+
+        # 8. State: DONE
+        self.state = DroneState.DONE
+        self.get_logger().info(
+            '=== [FSM: DONE] Autonomous Frontier Exploration Mission Successfully Completed! ==='
+        )
 
 
 def main():
     rclpy.init()
     node = AutoMapper()
     try:
-        node.run_mapping_mission()
+        node.run_exploration_mission()
     except KeyboardInterrupt:
+        node.get_logger().info('Mission interrupted by user. Stopping drone.')
         node.publish_zero_setpoint()
     finally:
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
