@@ -234,7 +234,9 @@ class AutoMapper(Node):
 
         # Operational Parameters
         self.cruising_speed = 0.18        # m/s (safe speed to eliminate motion blur in RTAB-Map)
-        self.target_altitude = 1.8        # Cruising altitude (minimum 1.8m in ENU frame)
+        self.target_altitude = 2.7        # Cruising altitude (ground_z + 1.5m, set dynamically before takeoff)
+        self.ground_z = 0.0              # Ground reference altitude captured before takeoff (EKF offset compensation)
+        self.climb_offset = 1.5          # Target climb height above ground (metres)
         self.max_exploration_time = 360.0  # Max exploration duration before RTH (seconds)
         self.max_frontier_duration = 22.0  # Stagnation timeout on a single frontier (seconds)
 
@@ -394,11 +396,12 @@ class AutoMapper(Node):
             PositionTarget.IGNORE_YAW_RATE
         )  # Value: 2531 (0x09E3)
 
-        # Coordinate Frame in ENU (where Z is positive upwards)
-        self.FRAME_LOCAL_ENU = getattr(PositionTarget, 'FRAME_LOCAL_ENU', 11)
+        # Use FRAME_LOCAL_NED (value=1) — this is the only frame accepted by the
+        # MAVROS setpoint_raw/local plugin. MAVROS converts ENU→NED internally,
+        # so all Z values passed here should be POSITIVE = upward in our ENU world.
         self.cmd_twist = Twist()
         self.cmd_raw = PositionTarget()
-        self.cmd_raw.coordinate_frame = self.FRAME_LOCAL_ENU
+        self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
         self.cmd_raw.type_mask = self.MASK_YAW_RATE
         self.cmd_raw.position.x = 0.0
         self.cmd_raw.position.y = 0.0
@@ -408,6 +411,7 @@ class AutoMapper(Node):
         self.cmd_raw.velocity.z = 0.0
         self.cmd_raw.yaw = 0.0
         self.cmd_raw.yaw_rate = 0.0
+
 
         # 50 Hz Heartbeat streaming timer
         self.timer = self.create_timer(0.02, self.timer_cb)
@@ -499,18 +503,22 @@ class AutoMapper(Node):
         return math.atan2(math.sin(angle), math.cos(angle))
 
     def set_vel(self, vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0, target_z=None):
-        """Sets linear and angular velocity commands with locked altitude in ENU."""
+        """Sets linear and angular velocity commands with locked altitude.
+        MAVROS FRAME_LOCAL_NED is used — MAVROS converts ENU→NED internally.
+        All Z values are in the ENU world frame (positive = upward).
+        """
         self.cmd_twist.linear.x = float(vx)
         self.cmd_twist.linear.y = float(vy)
         self.cmd_twist.linear.z = float(vz)
         self.cmd_twist.angular.z = float(yaw_rate)
 
+        min_safe_z = self.ground_z + self.climb_offset
         if target_z is not None:
-            self.target_altitude = max(1.8, float(target_z))
-        elif self.target_altitude < 1.8:
-            self.target_altitude = 1.8
+            self.target_altitude = max(min_safe_z, float(target_z))
+        elif self.target_altitude < min_safe_z:
+            self.target_altitude = min_safe_z
 
-        self.cmd_raw.coordinate_frame = self.FRAME_LOCAL_ENU
+        self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
         self.cmd_raw.type_mask = self.MASK_YAW_RATE
         self.cmd_raw.position.x = 0.0
         self.cmd_raw.position.y = 0.0
@@ -524,20 +532,21 @@ class AutoMapper(Node):
     def set_yaw_position_setpoint(self, target_yaw: float, target_z: Optional[float] = None):
         """
         Configures PositionTarget for Yaw Position Control (used in static rotation steps):
-        - coordinate_frame = FRAME_LOCAL_ENU (11 / ENU)
-        - type_mask = 2531 (IGNORE_YAW = 0, IGNORE_YAW_RATE = 2048)
-        - position.z = self.target_altitude (guaranteed >= 1.8m in ENU)
+        - coordinate_frame = FRAME_LOCAL_NED (value=1, accepted by MAVROS setpoint_raw plugin)
+        - type_mask = 2531 (IGNORE_YAW_RATE=2048; active yaw position + locked Z + zero velocity)
+        - position.z = self.target_altitude (>= ground_z + climb_offset, ENU value)
         - yaw = target_yaw wrapped in [-pi, pi]
         - velocity x, y, z = 0.0
         """
+        min_safe_z = self.ground_z + self.climb_offset
         if target_z is not None:
-            self.target_altitude = max(1.8, float(target_z))
-        elif self.target_altitude < 1.8:
-            self.target_altitude = 1.8
+            self.target_altitude = max(min_safe_z, float(target_z))
+        elif self.target_altitude < min_safe_z:
+            self.target_altitude = min_safe_z
 
         wrapped_yaw = float(self.wrap_pi(target_yaw))
 
-        self.cmd_raw.coordinate_frame = self.FRAME_LOCAL_ENU
+        self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
         self.cmd_raw.type_mask = self.MASK_YAW_POSITION
         self.cmd_raw.position.x = 0.0
         self.cmd_raw.position.y = 0.0
@@ -624,28 +633,53 @@ class AutoMapper(Node):
             self.target_marker_pub.publish(tm)
 
     # ── Takeoff & Mode Switching Routines ──────────────────────────────────
-    def perform_takeoff(self, target_alt: float = 1.8) -> bool:
-        """Executes armored automated takeoff and dynamic altitude synchronization."""
+    def perform_takeoff(self, target_alt: float = 1.5) -> bool:
+        """Executes automated takeoff with relative altitude above real ground.
+
+        Captures ground_z (the EKF2 Z reading while on the ground, which includes
+        simulation origin offsets of ~1.2 m in Gazebo) and sets target_altitude to
+        ground_z + climb_offset so the drone climbs a true 1.5 m above the surface.
+        """
+        # --- Capture real ground reference (average over 0.5 s) ---
+        gz_samples = []
+        t_sample = time.time()
+        while time.time() - t_sample < 0.5:
+            gz_samples.append(self.current_pose.pose.position.z)
+            rclpy.spin_once(self, timeout_sec=0.05)
+        self.ground_z = float(sum(gz_samples) / max(1, len(gz_samples)))
+        abs_target = self.ground_z + self.climb_offset
+        self.target_altitude = abs_target
+        self.get_logger().info(
+            f'Ground reference captured: ground_z={self.ground_z:.3f}m  '
+            f'→  target_altitude={self.target_altitude:.3f}m '
+            f'(ground_z + {self.climb_offset:.1f}m)'
+        )
+
+        # --- Check if already airborne (relative to ground_z) ---
         alt = self.current_pose.pose.position.z
-        if alt >= 1.5 and self.current_state.armed:
+        if (alt - self.ground_z) >= (self.climb_offset * 0.8) and self.current_state.armed:
             self.target_altitude = float(alt)
             self.cmd_raw.position.z = float(self.target_altitude)
-            self.cmd_raw.coordinate_frame = self.FRAME_LOCAL_ENU
+            self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
             self.get_logger().info(
-                f'Vehicle already airborne at {alt:.2f}m. '
-                f'Dynamically adopting target_altitude = {self.target_altitude:.2f}m in ENU frame.'
+                f'Vehicle already airborne at {alt:.2f}m (ground_z={self.ground_z:.2f}m). '
+                f'Adopting target_altitude = {self.target_altitude:.2f}m.'
             )
             return True
 
-        self.get_logger().info(f'Initiating automatic takeoff to {target_alt:.1f}m...')
-        self.target_altitude = max(1.8, float(target_alt))
+        self.get_logger().info(
+            f'Initiating automatic takeoff to abs {abs_target:.2f}m '
+            f'(+{self.climb_offset:.1f}m above ground_z={self.ground_z:.2f}m)...'
+        )
+        self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        self.cmd_raw.position.z = float(self.target_altitude)
         self.publish_zero_setpoint(target_z=self.target_altitude)
         self.sleep_and_stream(1.0)
 
         for attempt in range(1, 6):
             alt = self.current_pose.pose.position.z
-            if alt >= 1.2:
-                self.get_logger().info(f'Takeoff detected! Alt: {alt:.2f}m')
+            if (alt - self.ground_z) >= 0.3:
+                self.get_logger().info(f'Takeoff detected! Alt: {alt:.2f}m (rel: {alt-self.ground_z:.2f}m)')
                 break
 
             self.get_logger().info(f'Takeoff attempt {attempt}/5...')
@@ -687,32 +721,40 @@ class AutoMapper(Node):
 
             self.sleep_and_stream(1.0)
 
-        # Monitor climb
+        # Monitor climb — wait until drone is climb_offset * 0.8 above ground
         t_start = time.time()
         step = 0
-        while rclpy.ok() and (time.time() - t_start < 15.0):
+        climb_threshold = self.ground_z + self.climb_offset * 0.8
+        while rclpy.ok() and (time.time() - t_start < 20.0):
             alt = self.current_pose.pose.position.z
             step += 1
             if step % 5 == 0:
-                self.get_logger().info(f'Climbing... Alt: {alt:.2f}m / Target: {self.target_altitude:.1f}m')
-            if alt >= 1.5:
-                self.get_logger().info(f'Target altitude reached ({alt:.2f}m)!')
+                self.get_logger().info(
+                    f'Climbing... Alt: {alt:.2f}m (rel: {alt-self.ground_z:.2f}m) '
+                    f'/ Target: {self.target_altitude:.2f}m'
+                )
+            if alt >= climb_threshold:
+                self.get_logger().info(
+                    f'Target altitude reached! Alt={alt:.2f}m (rel={alt-self.ground_z:.2f}m)'
+                )
                 break
             self.sleep_and_stream(0.2)
 
-        # Settle and dynamically adopt the actual reached takeoff altitude (minimum 1.8m guaranteed)
+        # Settle and lock actual reached altitude
         self.sleep_and_stream(1.5)
         current_alt = self.current_pose.pose.position.z
-        if current_alt >= 1.5:
+        rel_alt = current_alt - self.ground_z
+        if rel_alt >= self.climb_offset * 0.8:
             self.target_altitude = float(current_alt)
         else:
-            self.target_altitude = 1.8
+            # Drone did not reach safe height — keep target at ground_z + climb_offset
+            self.target_altitude = self.ground_z + self.climb_offset
 
         self.cmd_raw.position.z = float(self.target_altitude)
-        self.cmd_raw.coordinate_frame = self.FRAME_LOCAL_ENU
+        self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
         self.get_logger().info(
-            f'Takeoff settled. Guaranteed target_altitude = {self.target_altitude:.2f}m '
-            f'(actual alt: {current_alt:.2f}m) in ENU frame'
+            f'Takeoff settled. Locked target_altitude = {self.target_altitude:.3f}m '
+            f'(actual={current_alt:.3f}m, rel={rel_alt:.3f}m above ground_z={self.ground_z:.3f}m)'
         )
 
         self.publish_zero_setpoint(target_z=self.target_altitude)
@@ -720,31 +762,36 @@ class AutoMapper(Node):
         return True
 
     def switch_to_offboard(self, pre_stream_sec: float = 2.0, max_wait_sec: float = 8.0) -> bool:
-        """Transitions cleanly to OFFBOARD mode with guaranteed safe altitude lock in ENU frame."""
+        """Transitions cleanly to OFFBOARD mode with safe altitude lock.
+        Uses FRAME_LOCAL_NED — MAVROS converts ENU→NED internally.
+        Altitude thresholds are relative to ground_z captured at takeoff.
+        """
+        min_safe_z = self.ground_z + self.climb_offset
         actual_z = self.current_pose.pose.position.z
-        if actual_z >= 1.5:
+        if actual_z >= min_safe_z * 0.8:
             self.target_altitude = float(actual_z)
         else:
-            self.target_altitude = 1.8
+            self.target_altitude = min_safe_z
 
-        self.cmd_raw.coordinate_frame = self.FRAME_LOCAL_ENU
+        self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
         self.cmd_raw.position.z = float(self.target_altitude)
 
         self.get_logger().info(
             f'>>> Step 1/3: Pre-streaming hybrid setpoints for {pre_stream_sec:.1f}s '
-            f'(vx=0, vy=0, locked z={self.target_altitude:.2f}m in ENU)...'
+            f'(vx=0, vy=0, locked z={self.target_altitude:.2f}m '
+            f'[ground_z={self.ground_z:.2f}m + rel={self.target_altitude-self.ground_z:.2f}m])...'
         )
         self.publish_zero_setpoint(target_z=self.target_altitude)
         self.sleep_and_stream(pre_stream_sec)
 
         if self.current_state.mode == 'OFFBOARD':
             actual_alt = self.current_pose.pose.position.z
-            if actual_alt >= 1.5:
+            if actual_alt >= min_safe_z * 0.8:
                 self.target_altitude = float(actual_alt)
             else:
-                self.target_altitude = 1.8
+                self.target_altitude = min_safe_z
             self.cmd_raw.position.z = float(self.target_altitude)
-            self.cmd_raw.coordinate_frame = self.FRAME_LOCAL_ENU
+            self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
             self.get_logger().info(f'Vehicle already in OFFBOARD mode at altitude {self.target_altitude:.2f}m.')
             return True
 
@@ -763,15 +810,16 @@ class AutoMapper(Node):
 
             if self.current_state.mode == 'OFFBOARD':
                 confirmed_alt = self.current_pose.pose.position.z
-                if confirmed_alt >= 1.5:
+                if confirmed_alt >= min_safe_z * 0.8:
                     self.target_altitude = float(confirmed_alt)
                 else:
-                    self.target_altitude = 1.8
+                    self.target_altitude = min_safe_z
                 self.cmd_raw.position.z = float(self.target_altitude)
-                self.cmd_raw.coordinate_frame = self.FRAME_LOCAL_ENU
+                self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
                 self.get_logger().info(
-                    f'>>> OFFBOARD Mode Confirmed! Guaranteed locked target_altitude: {self.target_altitude:.2f}m '
-                    f'(Current alt: {self.current_pose.pose.position.z:.2f}m) in ENU frame'
+                    f'>>> OFFBOARD Mode Confirmed! Locked target_altitude: {self.target_altitude:.3f}m '
+                    f'(actual={self.current_pose.pose.position.z:.3f}m, '
+                    f'rel={self.target_altitude-self.ground_z:.3f}m above ground_z={self.ground_z:.3f}m)'
                 )
                 self.publish_zero_setpoint(target_z=self.target_altitude)
                 break
@@ -786,7 +834,7 @@ class AutoMapper(Node):
             return False
 
         self.get_logger().info(
-            f'>>> Step 3/3: Holding stable OFFBOARD hover for 2.0s at locked z={self.target_altitude:.2f}m in ENU...'
+            f'>>> Step 3/3: Holding stable OFFBOARD hover for 2.0s at locked z={self.target_altitude:.3f}m...'
         )
         self.publish_zero_setpoint(target_z=self.target_altitude)
         self.sleep_and_stream(2.0)
@@ -1004,10 +1052,11 @@ class AutoMapper(Node):
         # 2. State: TAKEOFF
         self.state = DroneState.TAKEOFF
         self.get_logger().info('=== [FSM: TAKEOFF] Initiating Autonomous Liftoff ===')
-        takeoff_ok = self.perform_takeoff(target_alt=self.target_altitude)
+        takeoff_ok = self.perform_takeoff(target_alt=self.climb_offset)
         if not takeoff_ok:
-            if self.current_pose.pose.position.z >= 1.0:
-                self.get_logger().info('Manual takeoff detected! Proceeding.')
+            rel_alt = self.current_pose.pose.position.z - self.ground_z
+            if rel_alt >= 0.5:
+                self.get_logger().info(f'Manual takeoff detected (rel={rel_alt:.2f}m)! Proceeding.')
             else:
                 self.get_logger().error('Could not achieve takeoff. Aborting.')
                 return
