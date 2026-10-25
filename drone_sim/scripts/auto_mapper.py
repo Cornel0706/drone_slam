@@ -369,14 +369,10 @@ class AutoMapper(Node):
         self.odom_has_nan = False
         self.last_odom_time = 0.0
 
-        # Setpoint message templates
-        self.cmd_twist = Twist()
-        self.cmd_raw = PositionTarget()
-        self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
-        # type_mask = 1507 (0x05E3):
-        # Ignore PX, PY (1, 2) | Control PZ (0) | Control VX, VY (0) |
-        # Ignore VZ (32) | Ignore AFX, AFY, AFZ (448) | Ignore YAW (1024) | Control YAW_RATE (0)
-        self.cmd_raw.type_mask = (
+        # Dedicated MAVROS PositionTarget Masks:
+        # 1. Yaw Rate Control (Used during forward navigation):
+        # Controls: PZ, VX, VY, YAW_RATE. Ignores: PX, PY, VZ, AFX, AFY, AFZ, YAW.
+        self.MASK_YAW_RATE = (
             PositionTarget.IGNORE_PX |
             PositionTarget.IGNORE_PY |
             PositionTarget.IGNORE_VZ |
@@ -384,7 +380,25 @@ class AutoMapper(Node):
             PositionTarget.IGNORE_AFY |
             PositionTarget.IGNORE_AFZ |
             PositionTarget.IGNORE_YAW
-        )
+        )  # Value: 1507 (0x05E3)
+
+        # 2. Yaw Position Control (Used during Panoramic Scan & Discrete Yaw Steps):
+        # Controls: PZ, VX, VY, YAW. Ignores: PX, PY, VZ, AFX, AFY, AFZ, YAW_RATE.
+        self.MASK_YAW_POSITION = (
+            PositionTarget.IGNORE_PX |
+            PositionTarget.IGNORE_PY |
+            PositionTarget.IGNORE_VZ |
+            PositionTarget.IGNORE_AFX |
+            PositionTarget.IGNORE_AFY |
+            PositionTarget.IGNORE_AFZ |
+            PositionTarget.IGNORE_YAW_RATE
+        )  # Value: 2531 (0x09E3)
+
+        # Setpoint message templates
+        self.cmd_twist = Twist()
+        self.cmd_raw = PositionTarget()
+        self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        self.cmd_raw.type_mask = self.MASK_YAW_RATE
         self.cmd_raw.position.x = 0.0
         self.cmd_raw.position.y = 0.0
         self.cmd_raw.position.z = float(self.target_altitude)
@@ -478,6 +492,11 @@ class AutoMapper(Node):
         stamped.twist = self.cmd_twist
         self.vel_stamped_pub.publish(stamped)
 
+    @staticmethod
+    def wrap_pi(angle: float) -> float:
+        """Wraps any angle into the [-pi, pi] interval."""
+        return math.atan2(math.sin(angle), math.cos(angle))
+
     def set_vel(self, vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0, target_z=None):
         """Sets linear and angular velocity commands with locked altitude."""
         self.cmd_twist.linear.x = float(vx)
@@ -488,6 +507,8 @@ class AutoMapper(Node):
         if target_z is not None:
             self.target_altitude = float(target_z)
 
+        self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        self.cmd_raw.type_mask = self.MASK_YAW_RATE
         self.cmd_raw.position.x = 0.0
         self.cmd_raw.position.y = 0.0
         self.cmd_raw.position.z = float(self.target_altitude)
@@ -496,6 +517,35 @@ class AutoMapper(Node):
         self.cmd_raw.velocity.z = 0.0
         self.cmd_raw.yaw = 0.0
         self.cmd_raw.yaw_rate = float(yaw_rate)
+
+    def set_yaw_position_setpoint(self, target_yaw: float, target_z: Optional[float] = None):
+        """
+        Configures PositionTarget for Yaw Position Control (used in static rotation steps):
+        - type_mask = 2531 (IGNORE_YAW = 0, IGNORE_YAW_RATE = 2048)
+        - position.z = self.target_altitude (rigid closed-loop altitude hold)
+        - yaw = target_yaw wrapped in [-pi, pi]
+        - velocity x, y, z = 0.0
+        """
+        if target_z is not None:
+            self.target_altitude = float(target_z)
+
+        wrapped_yaw = float(self.wrap_pi(target_yaw))
+
+        self.cmd_raw.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        self.cmd_raw.type_mask = self.MASK_YAW_POSITION
+        self.cmd_raw.position.x = 0.0
+        self.cmd_raw.position.y = 0.0
+        self.cmd_raw.position.z = float(self.target_altitude)
+        self.cmd_raw.velocity.x = 0.0
+        self.cmd_raw.velocity.y = 0.0
+        self.cmd_raw.velocity.z = 0.0
+        self.cmd_raw.yaw = wrapped_yaw
+        self.cmd_raw.yaw_rate = 0.0
+
+        self.cmd_twist.linear.x = 0.0
+        self.cmd_twist.linear.y = 0.0
+        self.cmd_twist.linear.z = 0.0
+        self.cmd_twist.angular.z = 0.0
 
     def publish_zero_setpoint(self, target_z=None):
         """Halts all horizontal and rotational motion while maintaining altitude lock."""
@@ -507,8 +557,8 @@ class AutoMapper(Node):
         end_time = time.time() + duration_sec
         while rclpy.ok() and time.time() < end_time:
             self.timer_cb()
-            rclpy.spin_once(self, timeout_sec=0.02)
-            time.sleep(0.02)
+            remaining = max(0.001, min(0.02, end_time - time.time()))
+            rclpy.spin_once(self, timeout_sec=remaining)
 
     # ── RViz Visualization Markers ─────────────────────────────────────────
     def publish_frontier_markers(self, candidates: List[FrontierCandidate], active: Optional[FrontierCandidate]):
@@ -695,7 +745,6 @@ class AutoMapper(Node):
         while rclpy.ok() and (time.time() - t_start < max_wait_sec):
             self.publish_zero_setpoint(target_z=self.target_altitude)
             rclpy.spin_once(self, timeout_sec=0.02)
-            time.sleep(0.02)
 
             if self.current_state.mode == 'OFFBOARD':
                 confirmed_alt = self.current_pose.pose.position.z
@@ -801,6 +850,81 @@ class AutoMapper(Node):
         self.set_vel(vx=vx_enu, vy=vy_enu, vz=0.0, yaw_rate=yaw_rate, target_z=self.target_altitude)
         return False, dist
 
+    # ── Non-Blocking Panoramic Scan ────────────────────────────────────────
+    def execute_panoramic_scan(self, total_steps: int = 12, pause_duration: float = 0.8, rot_timeout: float = 2.0):
+        """
+        Executes a non-blocking, asynchronous 360° step-and-settle scan:
+        1. Non-blocking: Completely eliminates time.sleep(). timer_cb publishes
+           uninterrupted at 50 Hz on /mavros/setpoint_raw/local during rotation and settle pauses.
+        2. Dedicated type_mask for Yaw Position:
+           - IGNORE_YAW = 0 (active yaw position control)
+           - IGNORE_YAW_RATE = 2048 (yaw rate ignored)
+           - IGNORE_PZ = 0 (active Z closed-loop position PID hold)
+           - IGNORE_VX = 0, IGNORE_VY = 0 (velocity locked to 0.0)
+           - type_mask = 2531 (0x09E3)
+        3. cmd_raw.yaw is computed in radians in [-pi, pi] using wrap_pi.
+        4. cmd_raw.position.z is permanently synchronized to self.target_altitude.
+        """
+        self.state = DroneState.PANORAMIC_SCAN
+        self.get_logger().info(
+            f'=== [FSM: PANORAMIC_SCAN] Executing Non-Blocking 360° Yaw-Position Scan '
+            f'({total_steps} steps of 30°, locked z={self.target_altitude:.2f}m) ==='
+        )
+
+        start_yaw = self.get_current_yaw()
+        step_angle = (2.0 * math.pi) / total_steps
+
+        for step in range(1, total_steps + 1):
+            # 1. Target yaw in radians strictly wrapped to [-pi, pi]
+            target_yaw = self.wrap_pi(start_yaw + step * step_angle)
+            target_deg = math.degrees(target_yaw)
+
+            # 2. Configure dedicated Yaw Position type_mask (2531) with locked Z altitude and 0 velocity
+            self.set_yaw_position_setpoint(target_yaw=target_yaw, target_z=self.target_altitude)
+
+            # ── Phase A: Non-blocking Rotation Step ────────────────────
+            # Continually publish at 50 Hz while FCU rotates towards target_yaw
+            t_rot_start = time.time()
+            while rclpy.ok() and (time.time() - t_rot_start < rot_timeout):
+                if not self.is_odometry_healthy():
+                    self.handle_recovery()
+                    # Re-enforce yaw position target upon recovery
+                    self.set_yaw_position_setpoint(target_yaw=target_yaw, target_z=self.target_altitude)
+
+                # Maintain 50 Hz publishing without time.sleep()
+                self.timer_cb()
+                rclpy.spin_once(self, timeout_sec=0.02)
+
+                # Check if FCU has reached target yaw within tolerance
+                yaw_err = abs(self.wrap_pi(target_yaw - self.get_current_yaw()))
+                if yaw_err < math.radians(3.5):
+                    break
+
+            # ── Phase B: Non-blocking Settle Pause ──────────────────────
+            # Hold exact target yaw position and locked altitude for pause_duration
+            t_settle_start = time.time()
+            while rclpy.ok() and (time.time() - t_settle_start < pause_duration):
+                if not self.is_odometry_healthy():
+                    self.handle_recovery()
+                    self.set_yaw_position_setpoint(target_yaw=target_yaw, target_z=self.target_altitude)
+
+                # Continuous 50 Hz setpoint publication without time.sleep()
+                self.timer_cb()
+                rclpy.spin_once(self, timeout_sec=0.02)
+
+            self.get_logger().info(
+                f'Panoramic Scan: Step {step}/{total_steps} settled at {target_deg:.1f}° '
+                f'(alt: {self.current_pose.pose.position.z:.2f}m / target: {self.target_altitude:.2f}m)'
+            )
+
+        self.get_logger().info(
+            f'>>> Panoramic Map Seeding Complete! Holding steady hover at locked z={self.target_altitude:.2f}m...'
+        )
+        t_final = time.time()
+        while rclpy.ok() and (time.time() - t_final < 1.5):
+            self.timer_cb()
+            rclpy.spin_once(self, timeout_sec=0.02)
+
     # ── Autonomous Landing Routine ─────────────────────────────────────────
     def execute_landing(self):
         """Safely commands autonomous descent and monitors touchdown."""
@@ -888,31 +1012,7 @@ class AutoMapper(Node):
         )
 
         # 4. State: PANORAMIC_SCAN
-        self.state = DroneState.PANORAMIC_SCAN
-        self.get_logger().info('=== [FSM: PANORAMIC_SCAN] Executing Initial 360° Localization & Map Seeding ===')
-        total_steps = 12
-        step_angle_deg = 360.0 / total_steps
-        yaw_speed = 0.22  # rad/s (~12.6 deg/s)
-        step_duration = math.radians(step_angle_deg) / yaw_speed
-        pause_duration = 0.8
-
-        for step in range(1, total_steps + 1):
-            deg = step * step_angle_deg
-            # Incremental yaw step
-            t_rot = time.time()
-            while rclpy.ok() and (time.time() - t_rot < step_duration):
-                if not self.is_odometry_healthy():
-                    self.handle_recovery()
-                self.set_vel(vx=0.0, vy=0.0, vz=0.0, yaw_rate=yaw_speed, target_z=self.target_altitude)
-                self.sleep_and_stream(0.02)
-
-            self.publish_zero_setpoint(target_z=self.target_altitude)
-            self.sleep_and_stream(pause_duration)
-            self.get_logger().info(f'Panoramic Scan: Step {step}/{total_steps} ({deg:.0f}° completed)')
-
-        self.get_logger().info('>>> Panoramic Map Seeding Complete! Settle hover for 2s...')
-        self.publish_zero_setpoint(target_z=self.target_altitude)
-        self.sleep_and_stream(2.0)
+        self.execute_panoramic_scan(total_steps=12, pause_duration=0.8, rot_timeout=2.0)
 
         # Wait for the first valid occupancy grid from RTAB-Map
         self.get_logger().info('Waiting for initial RTAB-Map occupancy grid...')
